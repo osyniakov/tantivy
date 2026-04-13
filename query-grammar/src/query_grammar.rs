@@ -327,7 +327,7 @@ fn exists(inp: &str) -> IResult<&str, UserInputLeaf> {
             peek(alt((
                 value(
                     "",
-                    satisfy(|c: char| c.is_whitespace() || ESCAPE_IN_WORD.contains(&c)),
+                    satisfy(|c: char| c != ':' && (c.is_whitespace() || ESCAPE_IN_WORD.contains(&c))),
                 ),
                 eof,
             ))),
@@ -1788,6 +1788,15 @@ mod test {
         test_parse_query_to_ast_helper("a:b*", "\"a\":b*");
         test_parse_query_to_ast_helper("a:*b", "\"a\":*b");
         test_parse_query_to_ast_helper(r#"a:*def*"#, "\"a\":*def*");
+    }
+
+    #[test]
+    fn test_parse_bare_star_colon_does_not_panic() {
+        // Regression: these inputs triggered a panic in UserInputLeaf::set_field
+        // via the exists parser accepting '*' followed by ':' (which is in ESCAPE_IN_WORD).
+        assert!(parse_to_ast("*:").is_err()); // strict: not a valid query
+        let _ = parse_to_ast_lenient("*:"); // lenient: must not panic
+        let _ = parse_to_ast_lenient("*\x0c\x0c*"); // another fuzzer-found crash input
     }
 
     #[test]

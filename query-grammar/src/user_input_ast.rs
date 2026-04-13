@@ -47,9 +47,14 @@ impl UserInputLeaf {
                 upper,
             },
             UserInputLeaf::Set { field: _, elements } => UserInputLeaf::Set { field, elements },
-            UserInputLeaf::Exists { field: _ } => UserInputLeaf::Exists {
-                field: field.expect("Exist query without a field isn't allowed"),
-            },
+            UserInputLeaf::Exists { field: _ } => {
+                if let Some(field) = field {
+                    UserInputLeaf::Exists { field }
+                } else {
+                    // '*' without a preceding field name — degrade to match-all
+                    UserInputLeaf::All
+                }
+            }
             UserInputLeaf::Regex { field: _, pattern } => UserInputLeaf::Regex { field, pattern },
         }
     }
