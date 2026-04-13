@@ -318,9 +318,7 @@ fn term_group_infallible(inp: &str) -> JResult<&str, UserInputAst> {
 
 fn exists(inp: &str) -> IResult<&str, UserInputLeaf> {
     value(
-        UserInputLeaf::Exists {
-            field: String::new(),
-        },
+        UserInputLeaf::Exists { field: None },
         tuple((
             multispace0,
             char('*'),
@@ -345,7 +343,7 @@ fn exists_precond(inp: &str) -> IResult<&str, (), ()> {
             peek(alt((
                 value(
                     "",
-                    satisfy(|c: char| c.is_whitespace() || ESCAPE_IN_WORD.contains(&c)),
+                    satisfy(|c: char| c != ':' && (c.is_whitespace() || ESCAPE_IN_WORD.contains(&c))),
                 ),
                 eof,
             ))), // we need to check this isn't a wildcard query
@@ -358,7 +356,7 @@ fn exists_infallible(inp: &str) -> JResult<&str, UserInputAst> {
     let (inp, (field_name, _, _)) =
         tuple((field_name, multispace0, char('*')))(inp).expect("precondition failed");
 
-    let exists = UserInputLeaf::Exists { field: field_name }.into();
+    let exists = UserInputLeaf::Exists { field: Some(field_name) }.into();
     Ok((inp, (exists, Vec::new())))
 }
 
