@@ -865,11 +865,15 @@ impl QueryParser {
                         )],
                     );
                 };
-                let json_subpaths = self
+                let (found_field, _) = try_tuple!(self
                     .split_full_path(&full_path)
-                    .is_some_and(|(f, _)| {
-                        self.schema.get_field_entry(f).field_type().value_type() == Type::Json
-                    });
+                    .ok_or_else(|| QueryParserError::FieldDoesNotExist(full_path.clone())));
+                let json_subpaths = self
+                    .schema
+                    .get_field_entry(found_field)
+                    .field_type()
+                    .value_type()
+                    == Type::Json;
                 (
                     Some(LogicalAst::Leaf(Box::new(LogicalLiteral::Exists {
                         field_name: full_path,
@@ -2147,6 +2151,12 @@ mod test {
         // field:* is an exists query
         let ast = parse_query_to_logical_ast("title:*", false).unwrap();
         assert_eq!(format!("{ast:?}"), "$exists(title)");
+
+        // unknown field is rejected at parse time, consistent with Range/Set/Regex
+        assert_eq!(
+            parse_query_to_logical_ast("unknown_field:*", false).unwrap_err(),
+            QueryParserError::FieldDoesNotExist("unknown_field".to_string()),
+        );
 
         // bare *: must not panic — strict parser rejects it, lenient degrades
         let query_parser = make_query_parser();

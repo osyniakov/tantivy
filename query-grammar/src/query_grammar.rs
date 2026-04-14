@@ -1782,6 +1782,9 @@ mod test {
         );
         test_parse_query_to_ast_helper("(a:*)", "$exists(\"a\")");
 
+        // term-group with bare *: All is promoted to Exists via set_default_field
+        test_parse_query_to_ast_helper("a:(*)", "$exists(\"a\")");
+
         // these are term/wildcard query (not a phrase prefix)
         test_parse_query_to_ast_helper("a:b*", "\"a\":b*");
         test_parse_query_to_ast_helper("a:*b", "\"a\":*b");
