@@ -21,7 +21,8 @@ pub enum UserInputLeaf {
         elements: Vec<String>,
     },
     Exists {
-        field: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        field: Option<String>,
     },
     Regex {
         field: Option<String>,
@@ -47,9 +48,7 @@ impl UserInputLeaf {
                 upper,
             },
             UserInputLeaf::Set { field: _, elements } => UserInputLeaf::Set { field, elements },
-            UserInputLeaf::Exists { field: _ } => UserInputLeaf::Exists {
-                field: field.expect("Exist query without a field isn't allowed"),
-            },
+            UserInputLeaf::Exists { field: _ } => UserInputLeaf::Exists { field },
             UserInputLeaf::Regex { field: _, pattern } => UserInputLeaf::Regex { field, pattern },
         }
     }
@@ -59,9 +58,12 @@ impl UserInputLeaf {
             UserInputLeaf::Literal(literal) if literal.field_name.is_none() => {
                 literal.field_name = Some(default_field)
             }
+            UserInputLeaf::Exists { field } if field.is_none() => {
+                *field = Some(default_field);
+            }
             UserInputLeaf::All => {
                 *self = UserInputLeaf::Exists {
-                    field: default_field,
+                    field: Some(default_field),
                 }
             }
             UserInputLeaf::Range { field, .. } if field.is_none() => *field = Some(default_field),
@@ -106,8 +108,11 @@ impl Debug for UserInputLeaf {
                 write!(formatter, "]")
             }
             UserInputLeaf::All => write!(formatter, "*"),
-            UserInputLeaf::Exists { field } => {
+            UserInputLeaf::Exists { field: Some(field) } => {
                 write!(formatter, "$exists(\"{field}\")")
+            }
+            UserInputLeaf::Exists { field: None } => {
+                write!(formatter, "$exists(*)")
             }
             UserInputLeaf::Regex { field, pattern } => {
                 if let Some(field) = field {

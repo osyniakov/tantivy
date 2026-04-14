@@ -318,16 +318,14 @@ fn term_group_infallible(inp: &str) -> JResult<&str, UserInputAst> {
 
 fn exists(inp: &str) -> IResult<&str, UserInputLeaf> {
     value(
-        UserInputLeaf::Exists {
-            field: String::new(),
-        },
+        UserInputLeaf::Exists { field: None },
         tuple((
             multispace0,
             char('*'),
             peek(alt((
                 value(
                     "",
-                    satisfy(|c: char| c.is_whitespace() || ESCAPE_IN_WORD.contains(&c)),
+                    satisfy(|c: char| c != ':' && (c.is_whitespace() || ESCAPE_IN_WORD.contains(&c))),
                 ),
                 eof,
             ))),
@@ -345,7 +343,7 @@ fn exists_precond(inp: &str) -> IResult<&str, (), ()> {
             peek(alt((
                 value(
                     "",
-                    satisfy(|c: char| c.is_whitespace() || ESCAPE_IN_WORD.contains(&c)),
+                    satisfy(|c: char| c != ':' && (c.is_whitespace() || ESCAPE_IN_WORD.contains(&c))),
                 ),
                 eof,
             ))), // we need to check this isn't a wildcard query
@@ -358,7 +356,7 @@ fn exists_infallible(inp: &str) -> JResult<&str, UserInputAst> {
     let (inp, (field_name, _, _)) =
         tuple((field_name, multispace0, char('*')))(inp).expect("precondition failed");
 
-    let exists = UserInputLeaf::Exists { field: field_name }.into();
+    let exists = UserInputLeaf::Exists { field: Some(field_name) }.into();
     Ok((inp, (exists, Vec::new())))
 }
 
@@ -1784,10 +1782,22 @@ mod test {
         );
         test_parse_query_to_ast_helper("(a:*)", "$exists(\"a\")");
 
+        // term-group with bare *: All is promoted to Exists via set_default_field
+        test_parse_query_to_ast_helper("a:(*)", "$exists(\"a\")");
+
         // these are term/wildcard query (not a phrase prefix)
         test_parse_query_to_ast_helper("a:b*", "\"a\":b*");
         test_parse_query_to_ast_helper("a:*b", "\"a\":*b");
         test_parse_query_to_ast_helper(r#"a:*def*"#, "\"a\":*def*");
+    }
+
+    #[test]
+    fn test_parse_bare_star_colon_does_not_panic() {
+        // Regression: these inputs triggered a panic in UserInputLeaf::set_field
+        // via the exists parser accepting '*' followed by ':' (which is in ESCAPE_IN_WORD).
+        assert!(parse_to_ast("*:").is_err()); // strict: not a valid query
+        let _ = parse_to_ast_lenient("*:"); // lenient: must not panic
+        let _ = parse_to_ast_lenient("*\x0c\x0c*"); // another fuzzer-found crash input
     }
 
     #[test]
