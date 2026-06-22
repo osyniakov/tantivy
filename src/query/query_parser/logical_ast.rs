@@ -24,6 +24,10 @@ pub enum LogicalLiteral {
         elements: Vec<Term>,
     },
     All,
+    Exists {
+        field_name: String,
+        json_subpaths: bool,
+    },
     Regex {
         pattern: Arc<Regex>,
         field: Field,
@@ -155,6 +159,9 @@ impl fmt::Debug for LogicalLiteral {
                 write!(formatter, "]")
             }
             LogicalLiteral::All => write!(formatter, "*"),
+            LogicalLiteral::Exists { ref field_name, .. } => {
+                write!(formatter, "$exists({field_name})")
+            }
             LogicalLiteral::Regex {
                 ref pattern,
                 ref field,
