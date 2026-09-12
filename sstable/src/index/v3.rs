@@ -22,6 +22,11 @@ impl SSTableIndexV3 {
         data: OwnedBytes,
         fst_length: u64,
     ) -> Result<SSTableIndexV3, SSTableDataCorruption> {
+        // `fst_length` is read from the file's footer, so it can claim more
+        // than the index holds; `split` would panic on that.
+        if fst_length > data.len() as u64 {
+            return Err(SSTableDataCorruption);
+        }
         let (fst_slice, block_addr_store_slice) = data.split(fst_length as usize);
         let fst_index = Fst::new(fst_slice)
             .map_err(|_| SSTableDataCorruption)?
@@ -341,9 +346,22 @@ struct BlockAddrStore {
 
 impl BlockAddrStore {
     fn open(term_info_store_file: OwnedBytes) -> io::Result<BlockAddrStore> {
+        // Both lengths below come from the file; `split` panics past the end.
+        if term_info_store_file.len() < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "sstable block address store is shorter than its length header",
+            ));
+        }
         let (mut len_slice, main_slice) = term_info_store_file.split(8);
-        let len = u64::deserialize(&mut len_slice)? as usize;
-        let (block_meta_bytes, addr_bytes) = main_slice.split(len);
+        let len = u64::deserialize(&mut len_slice)?;
+        if len > main_slice.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sstable block address store declares more metadata than it holds",
+            ));
+        }
+        let (block_meta_bytes, addr_bytes) = main_slice.split(len as usize);
         Ok(BlockAddrStore {
             block_meta_bytes,
             addr_bytes,

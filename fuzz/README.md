@@ -66,46 +66,44 @@ Targets are built with `--debug-assertions` in CI, so integer overflow and
 overflow that merely wraps in release is still a bug, and it is far easier to
 diagnose as a panic.
 
-## Known open findings
+## Findings so far
 
-This reproduces on the current tree. It is recorded here so the next person does
-not rediscover it and assume CI is simply broken. Reproduce it by writing the
-bytes to a file and replaying them:
+Fixed, each with a regression test:
+
+- a fieldless `Exists` resolved with `expect` — a two-character query panicked
+  `parse_query`;
+- a `FileSlice::split_from_end` / `slice_from_end` underflow, plus the footer
+  length checks the sstable and columnar readers needed on top of it;
+- a `VInt` / `VIntU128::deserialize` shift overflow on an over-long encoding;
+- an unbounded loop in `set_infallible`, reachable from any query containing
+  `IN[` — a 12-byte query reached 4 GB;
+- a truncated sstable block header;
+- the sstable value layer trusting its own block: `ValueReader::value` indexed
+  past the values a block declared, `deserialize_vint_u64` decoded a truncated
+  block as zeros and could overflow on an over-long encoding, and
+  `VecU32ValueReader` reserved a `Vec` sized by a length it had not checked;
+- the sstable key layer trusting its own block: a corrupt suffix length
+  advanced past the buffer, and a corrupt prefix length made the reader
+  resize its key to several exabytes;
+- block addresses from the index used to slice the sstable unchecked — a
+  corrupt index tripped `FileSlice`'s out-of-range assert on the first lookup;
+- the v3 index trusting its footer: an fst length and a block-store length
+  past the data, and a footer shorter than 8 bytes.
+
+### Still open
+
+Both reproduce on the current tree and are recorded here so the next person
+does not rediscover them and assume CI is simply broken. Replay one with:
 
 ```bash
-printf '%s' 0a00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001f1f0a02000000 \
-  | xxd -r -p > /tmp/crash
+printf '%s' <hex> | xxd -r -p > /tmp/crash
 cargo fuzz run sstable_dictionary /tmp/crash
 ```
 
-| Target | Symptom | Reproducer (hex) |
+| Where | What | Reproducer (hex) |
 | --- | --- | --- |
-| `sstable_dictionary` | Panic indexing out of bounds in `IndexValueReader::value` (`sstable/src/value/index.rs`), reached from `SSTableIndex::open`. | `0a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001f1f0a02000000` (68B) |
-
-This one is not a local oversight, which is why it is not simply patched:
-
-- All four `ValueReader::value(idx)` impls index `self.vals[idx]` unchecked, and
-  the trait signature (`fn value(&self, idx: usize) -> &Self::Value`) cannot
-  report an error. A block whose key section decodes more entries than its value
-  section declared therefore indexes past the end.
-- `deserialize_vint_u64` (`sstable/src/value/mod.rs`) does `*data = &data[num_bytes..]`
-  with no check that `num_bytes` is in bounds.
-
-The layer was written for self-produced, trusted files. Hardening it means
-deciding on a contract: the natural fix is to add `fn num_values(&self) -> usize`
-to `ValueReader` and have the block readers refuse an out-of-range index, but
-`ValueReader` is public API, so a new required method is a breaking change.
-That is a call for the maintainers rather than something to settle inside a
-fuzzing change.
-
-Everything else found so far is fixed, with regression tests: a fieldless
-`Exists` `expect`, a `FileSlice::split_from_end` underflow, a `VInt::deserialize`
-shift overflow, an unbounded `set_infallible` loop reachable through `IN[`, and a
-truncated sstable block header.
-
-Three earlier findings — a fieldless `Exists` `expect`, a `FileSlice::split_from_end`
-underflow, and a `VInt::deserialize` shift overflow — are fixed, with regression
-tests in `query-grammar`, `tantivy-common`, `tantivy-sstable` and `tantivy-columnar`.
+| `tantivy-fst` (`raw/node.rs:305`), reached from `SSTableIndexV3::locate_with_key` | `Fst::new` accepts the bytes, but traversing the corrupt automaton panics. This is in the dependency, not in tantivy: the fix is for `tantivy-fst` to validate what `Fst::new` accepts (or for the v3 index to run `verify()` on open). | `0e00260001010000080000000000000000000000000000fffffffffbff002401000000000000000000000072727201027240ffffff2a07000000000000081f0a0240070000000030000000000000001f00000000000000081f0701f5f57af572727201027240ffffff2a07000000000000081f0a0240070000000030000000000000001f0000000000000010ffffffffff1e0a03000000` (151B) |
+| `BlockAddrStore` in `sstable/src/index/v3.rs` | Latent, behind the fst finding: the bit-packed block-address decoder trusts its metadata (`1 << (nbits - 1)` with `nbits == 0`, `assert!(num_bits <= 56)` on file bytes, unchecked `- range_shift`, and `.unwrap()`s that hold only for self-consistent files). This is a hot path written to be unchecked on purpose, so choosing between validating on open and checking per access is a maintainer decision. | none yet — the fst crash is hit first |
 
 ## Corpus and artifacts
 

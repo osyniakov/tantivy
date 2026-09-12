@@ -198,15 +198,35 @@ where TValueReader: value::ValueReader
         }
     }
 
-    fn read_delta_key(&mut self) -> bool {
+    fn read_delta_key(&mut self) -> io::Result<bool> {
         let Some((keep, add)) = self.read_keep_add() else {
-            return false;
+            return Ok(false);
         };
+        // `add` is read from the block. A corrupt block can claim a suffix
+        // longer than what is left, and advancing past the end would make the
+        // next `buffer()` slice out of bounds.
+        if add > self.block_reader.buffer().len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sstable block claims a key suffix longer than the block",
+            ));
+        }
+        // `keep` is the length of the prefix shared with the previous key, so
+        // it can never exceed that key's length. A corrupt value here made the
+        // caller resize its key buffer to `keep + add` bytes -- an allocation
+        // of up to 2^64 bytes.
+        let prev_key_len = self.common_prefix_len + self.suffix_range.len();
+        if keep > prev_key_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sstable block claims a key prefix longer than the previous key",
+            ));
+        }
         self.common_prefix_len = keep;
         let suffix_start = self.block_reader.offset();
         self.suffix_range = suffix_start..(suffix_start + add);
         self.block_reader.advance(add);
-        true
+        Ok(true)
     }
 
     pub fn advance(&mut self) -> io::Result<bool> {
@@ -220,7 +240,23 @@ where TValueReader: value::ValueReader
         } else {
             self.idx += 1;
         }
-        Ok(self.read_delta_key())
+        if !self.read_delta_key()? {
+            return Ok(false);
+        }
+        // Every key in a block has a value in the same block. A corrupt block
+        // whose key section outruns its value section used to make `value()`
+        // index past the end.
+        if self
+            .value_reader
+            .num_values()
+            .is_some_and(|num_values| self.idx >= num_values)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sstable block holds more keys than values",
+            ));
+        }
+        Ok(true)
     }
 
     #[inline(always)]
@@ -248,5 +284,63 @@ mod tests {
     fn test_empty() {
         let mut delta_reader: DeltaReader<U64MonotonicValueReader> = DeltaReader::empty();
         assert!(!delta_reader.advance().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod corrupt_block_tests {
+    use common::OwnedBytes;
+
+    use super::DeltaReader;
+    use crate::value::U64MonotonicValueReader;
+
+    // A single uncompressed block. The layout is `[len: u32 LE][compressed: u8]`
+    // followed by the value section, then the key section, then the 4-byte zero
+    // length that ends the stream.
+    fn block(content: &[u8]) -> OwnedBytes {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(content.len() as u32 + 1).to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(content);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        OwnedBytes::new(bytes)
+    }
+
+    // Regression test for a fuzzing finding: the block below declares one value
+    // but carries two keys, and reading the second key used to index past the
+    // end of the value reader's `Vec` and panic.
+    #[test]
+    fn more_keys_than_values_is_an_error() {
+        // values: count=1, delta=5   keys: (keep=0, add=1) "a", (keep=0, add=1) "b"
+        let mut reader = DeltaReader::<U64MonotonicValueReader>::new(block(&[
+            0x01, 0x05, 0x10, b'a', 0x10, b'b',
+        ]));
+        assert!(reader.advance().unwrap());
+        assert_eq!(*reader.value(), 5);
+        assert!(reader.advance().is_err());
+    }
+
+    #[test]
+    fn suffix_longer_than_block_is_an_error() {
+        // values: count=1, delta=5   key: (keep=0, add=15) but only one byte follows
+        let mut reader =
+            DeltaReader::<U64MonotonicValueReader>::new(block(&[0x01, 0x05, 0xf0, b'a']));
+        assert!(reader.advance().is_err());
+    }
+
+    #[test]
+    fn truncated_value_section_is_an_error() {
+        // values: count=3, but a single (continued) byte and then nothing
+        let mut reader = DeltaReader::<U64MonotonicValueReader>::new(block(&[0x03, 0x85]));
+        assert!(reader.advance().is_err());
+    }
+
+    #[test]
+    fn prefix_longer_than_previous_key_is_an_error() {
+        // values: count=1, delta=5   first key: (keep=5, add=1) "a" -- but there
+        // is no previous key to share five bytes with.
+        let mut reader =
+            DeltaReader::<U64MonotonicValueReader>::new(block(&[0x01, 0x05, 0x15, b'a']));
+        assert!(reader.advance().is_err());
     }
 }

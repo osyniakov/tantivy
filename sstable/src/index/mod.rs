@@ -29,6 +29,14 @@ impl SSTableIndex {
                 })?)
             }
             3 => {
+                // The v3 footer is 8 bytes; a shorter index cannot hold one,
+                // and `rsplit` would underflow on it.
+                if index_bytes.len() < 8 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "sstable v3 index is shorter than its footer",
+                    ));
+                }
                 let (index_bytes, mut footerv3_len_bytes) = index_bytes.rsplit(8);
                 let store_offset = u64::deserialize(&mut footerv3_len_bytes)?;
                 if store_offset != 0 {
