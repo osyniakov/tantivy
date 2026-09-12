@@ -1,8 +1,8 @@
 use std::{fmt, io, mem};
 
-use common::BinarySerializable;
 use common::file_slice::FileSlice;
 use common::json_path_writer::JSON_PATH_SEGMENT_SEP;
+use common::{BinarySerializable, HasLen};
 use sstable::{Dictionary, RangeSSTable};
 
 use crate::columnar::{ColumnType, format_version};
@@ -98,14 +98,37 @@ impl ColumnarReader {
     }
 
     fn open_inner(file_slice: FileSlice) -> io::Result<ColumnarReader> {
-        let (file_slice_without_sstable_len, footer_slice) = file_slice
-            .split_from_end(mem::size_of::<u64>() + 4 + format_version::VERSION_FOOTER_NUM_BYTES);
+        // sstable length (u64), number of rows (u32), then the version footer.
+        const FOOTER_NUM_BYTES: usize = mem::size_of::<u64>()
+            + mem::size_of::<u32>()
+            + format_version::VERSION_FOOTER_NUM_BYTES;
+
+        // The footer is taken off the end, so a file shorter than the footer has
+        // to be rejected here: the input is untrusted and the split would
+        // otherwise underflow.
+        if file_slice.len() < FOOTER_NUM_BYTES {
+            return Err(io_invalid_data(format!(
+                "columnar is too short: {} bytes, need at least {FOOTER_NUM_BYTES} for the footer",
+                file_slice.len()
+            )));
+        }
+        let (file_slice_without_sstable_len, footer_slice) =
+            file_slice.split_from_end(FOOTER_NUM_BYTES);
         let footer_bytes = footer_slice.read_bytes()?;
         let sstable_len = u64::deserialize(&mut &footer_bytes[0..8])?;
         let num_rows = u32::deserialize(&mut &footer_bytes[8..12])?;
         let version_footer_bytes: [u8; format_version::VERSION_FOOTER_NUM_BYTES] =
             footer_bytes[12..].try_into().unwrap();
         let format_version = format_version::parse_footer(version_footer_bytes)?;
+
+        // `sstable_len` comes out of the footer we just parsed, so it is itself
+        // untrusted and may be larger than what is actually present.
+        if sstable_len > file_slice_without_sstable_len.len() as u64 {
+            return Err(io_invalid_data(format!(
+                "columnar footer declares a {sstable_len}-byte sstable but only {} bytes remain",
+                file_slice_without_sstable_len.len()
+            )));
+        }
         let (column_data, sstable) =
             file_slice_without_sstable_len.split_from_end(sstable_len as usize);
         let column_dictionary = Dictionary::open(sstable)?;
@@ -219,6 +242,46 @@ mod tests {
     use common::json_path_writer::JSON_PATH_SEGMENT_SEP;
 
     use crate::{ColumnType, ColumnarReader, ColumnarWriter};
+
+    // Regression tests for a fuzzing finding: `ColumnarReader::open(b"")` used to
+    // panic with a subtraction overflow while splitting the footer off the end,
+    // instead of reporting the buffer as malformed.
+    #[test]
+    fn test_open_truncated_columnar_is_error() {
+        use crate::columnar::format_version;
+
+        let footer_num_bytes = std::mem::size_of::<u64>()
+            + std::mem::size_of::<u32>()
+            + format_version::VERSION_FOOTER_NUM_BYTES;
+        for len in 0..footer_num_bytes {
+            assert!(
+                ColumnarReader::open(vec![0u8; len]).is_err(),
+                "a {len}-byte buffer cannot hold the {footer_num_bytes}-byte footer and must be \
+                 rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_open_columnar_with_oversized_sstable_len_is_error() {
+        use crate::columnar::format_version;
+
+        let mut columnar_writer = ColumnarWriter::default();
+        columnar_writer.record_column_type("col", ColumnType::U64, false);
+        let mut buffer = Vec::new();
+        columnar_writer.serialize(1, None, &mut buffer).unwrap();
+        assert!(ColumnarReader::open(buffer.clone()).is_ok());
+
+        // The sstable length is the first field of the footer, and it is read
+        // straight out of the file. Claim it is u64::MAX (all 0xff, so this does
+        // not depend on the field's endianness).
+        let footer_start = buffer.len()
+            - (std::mem::size_of::<u64>()
+                + std::mem::size_of::<u32>()
+                + format_version::VERSION_FOOTER_NUM_BYTES);
+        buffer[footer_start..footer_start + std::mem::size_of::<u64>()].fill(0xff);
+        assert!(ColumnarReader::open(buffer).is_err());
+    }
 
     #[test]
     fn test_list_columns() {

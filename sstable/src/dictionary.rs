@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use common::bounds::{TransformBound, transform_bound_inner_res};
 use common::file_slice::FileSlice;
-use common::{BinarySerializable, ByteCount, OwnedBytes};
+use common::{BinarySerializable, ByteCount, HasLen, OwnedBytes};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use tantivy_fst::Automaton;
@@ -287,12 +287,40 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     /// Opens a `TermDictionary`.
     pub fn open(term_dictionary_file: FileSlice) -> io::Result<Self> {
+        // Index offset (u64), number of terms (u64), then the format version (u32).
+        const FOOTER_NUM_BYTES: usize = 2 * std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
+
         let num_bytes = term_dictionary_file.num_bytes();
-        let (main_slice, footer_len_slice) = term_dictionary_file.split_from_end(20);
+        // The footer is taken off the end, so anything shorter than the footer
+        // has to be rejected before splitting: the bytes are untrusted and the
+        // split would otherwise underflow.
+        if term_dictionary_file.len() < FOOTER_NUM_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "sstable is too short: {} bytes, need at least {FOOTER_NUM_BYTES} for the \
+                     footer",
+                    term_dictionary_file.len()
+                ),
+            ));
+        }
+        let (main_slice, footer_len_slice) = term_dictionary_file.split_from_end(FOOTER_NUM_BYTES);
         let mut footer_len_bytes: OwnedBytes = footer_len_slice.read_bytes()?;
         let index_offset = u64::deserialize(&mut footer_len_bytes)?;
         let num_terms = u64::deserialize(&mut footer_len_bytes)?;
         let version = u32::deserialize(&mut footer_len_bytes)?;
+
+        // `index_offset` was read from that footer, so it is untrusted too and
+        // `split` would panic on an offset past the end of the body.
+        if index_offset > main_slice.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "sstable index offset {index_offset} exceeds the {}-byte body",
+                    main_slice.len()
+                ),
+            ));
+        }
         let (sstable_slice, index_slice) = main_slice.split(index_offset as usize);
         let sstable_index_bytes = index_slice.read_bytes()?;
 
@@ -667,6 +695,32 @@ mod tests {
     use super::Dictionary;
     use crate::dictionary::TermOrdHit;
     use crate::{MonotonicU64SSTable, TermOrdinal};
+
+    // Regression tests for a fuzzing finding: `Dictionary::from_bytes(b"")` used
+    // to panic with a subtraction overflow while splitting the footer off the
+    // end, instead of reporting the buffer as malformed.
+    #[test]
+    fn test_dictionary_from_truncated_bytes_is_error() {
+        let footer_num_bytes = 2 * std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
+        for len in 0..footer_num_bytes {
+            let bytes = OwnedBytes::new(vec![0u8; len]);
+            assert!(
+                Dictionary::<MonotonicU64SSTable>::from_bytes(bytes).is_err(),
+                "a {len}-byte buffer cannot hold the {footer_num_bytes}-byte footer and must be \
+                 rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dictionary_with_out_of_bounds_index_offset_is_error() {
+        // Nothing but a footer, whose index offset points far past the body. All
+        // 0xff, so this does not depend on the field's endianness.
+        let mut bytes = vec![0u8; 2 * std::mem::size_of::<u64>() + std::mem::size_of::<u32>()];
+        bytes[0..std::mem::size_of::<u64>()].fill(0xff);
+        let dictionary = Dictionary::<MonotonicU64SSTable>::from_bytes(OwnedBytes::new(bytes));
+        assert!(dictionary.is_err());
+    }
 
     #[derive(Debug)]
     struct PermissionedHandle {
