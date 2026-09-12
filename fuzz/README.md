@@ -66,6 +66,26 @@ Targets are built with `--debug-assertions` in CI, so integer overflow and
 overflow that merely wraps in release is still a bug, and it is far easier to
 diagnose as a panic.
 
+## Known open findings
+
+These reproduce on the current tree. They are recorded here so the next person
+does not rediscover them and assume CI is simply broken. Reproduce one by
+writing the bytes to a file and replaying it:
+
+```bash
+printf '%s' 41001f3a494e5b0a0a0c7f5b | xxd -r -p > /tmp/oom
+cargo fuzz run query_parser /tmp/oom
+```
+
+| Target(s) | Symptom | Reproducer (hex) |
+| --- | --- | --- |
+| `query_grammar`, `query_parser` | Out of memory: >4 GB from a 12-byte query. Both reproducers contain `IN[`, the set-literal syntax, so a malformed set appears to allocate without bound. Reachable from any user-supplied query string. | `494e0a5b000a0a0b80000000000000000000000000002a3c` (24B)<br>`41001f3a494e5b0a0a0c7f5b` (12B) |
+| `sstable_dictionary` | Panic in `OwnedBytes::advance` (`ownedbytes/src/lib.rs`) via `SSTableIndex::open`: the index parser reads past the end of a short index slice. The footer itself is validated, so this is one level deeper. | `0a1f0000000100000000000000000000000000000002000000` (25B) |
+
+Three earlier findings — a fieldless `Exists` `expect`, a `FileSlice::split_from_end`
+underflow, and a `VInt::deserialize` shift overflow — are fixed, with regression
+tests in `query-grammar`, `tantivy-common`, `tantivy-sstable` and `tantivy-columnar`.
+
 ## Corpus and artifacts
 
 `fuzz/corpus/` and `fuzz/artifacts/` are gitignored — no seed corpus is checked

@@ -47,8 +47,12 @@ impl UserInputLeaf {
                 upper,
             },
             UserInputLeaf::Set { field: _, elements } => UserInputLeaf::Set { field, elements },
-            UserInputLeaf::Exists { field: _ } => UserInputLeaf::Exists {
-                field: field.expect("Exist query without a field isn't allowed"),
+            UserInputLeaf::Exists { field: _ } => match field {
+                Some(field) => UserInputLeaf::Exists { field },
+                // A `*` with no field in front of it is a match-all, which is
+                // exactly what `All` means; `set_default_field` turns it back
+                // into an `Exists` once a default field is known.
+                None => UserInputLeaf::All,
             },
             UserInputLeaf::Regex { field: _, pattern } => UserInputLeaf::Regex { field, pattern },
         }

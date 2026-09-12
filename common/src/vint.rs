@@ -37,6 +37,13 @@ impl BinarySerializable for VIntU128 {
         loop {
             match bytes.next() {
                 Some(Ok(b)) => {
+                    // Missing stop bit would shift past u128 width
+                    if shift >= 128 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "VInt is too long or missing stop bit",
+                        ));
+                    }
                     result |= u128::from(b % 128u8) << shift;
                     if b >= STOP_BIT {
                         return Ok(VIntU128(result));
@@ -206,6 +213,13 @@ impl BinarySerializable for VInt {
         loop {
             match bytes.next() {
                 Some(Ok(b)) => {
+                    // Missing stop bit would shift past u64 width
+                    if shift >= 64 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "VInt is too long or missing stop bit",
+                        ));
+                    }
                     result |= u64::from(b % 128u8) << shift;
                     if b >= STOP_BIT {
                         return Ok(VInt(result));
@@ -280,5 +294,53 @@ mod tests {
             aux_test_serialize_vint_u32(power_of_128 + 1u32);
         }
         aux_test_serialize_vint_u32(u32::MAX);
+    }
+
+    #[test]
+    fn test_vint_fuzz_reproducer() {
+        // Regression test for fuzzing finding: exact reproducer bytes should not panic
+        let bytes: &[u8] = b"\x00\x00\x00\x00\x00\x14\x14\x00\x00B\xa2";
+        let mut cursor: &[u8] = bytes;
+        let result = VInt::deserialize(&mut cursor);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vint_missing_stop_bit() {
+        // Regression test for fuzzing finding: long continuation bytes return Err
+        let bytes = [0u8; 20];
+        let mut cursor: &[u8] = &bytes[..];
+        let result = VInt::deserialize(&mut cursor);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vintu128_missing_stop_bit() {
+        // Regression test for fuzzing finding: long continuation bytes return Err for u128
+        let bytes = [0u8; 30];
+        let mut cursor: &[u8] = &bytes[..];
+        let result = <super::VIntU128 as BinarySerializable>::deserialize(&mut cursor);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vint_max_value_roundtrip() {
+        // Regression test: u64::MAX should still roundtrip correctly after bounds check
+        let max_vint = VInt(u64::MAX);
+        let mut buffer = Vec::new();
+        max_vint.serialize(&mut buffer).unwrap();
+        let deserialized = VInt::deserialize(&mut &buffer[..]).unwrap();
+        assert_eq!(max_vint.0, deserialized.0);
+    }
+
+    #[test]
+    fn test_vintu128_max_value_roundtrip() {
+        // Regression test: u128::MAX should still roundtrip correctly after bounds check
+        let max_vintu128 = super::VIntU128(u128::MAX);
+        let mut buffer = Vec::new();
+        max_vintu128.serialize(&mut buffer).unwrap();
+        let deserialized =
+            <super::VIntU128 as BinarySerializable>::deserialize(&mut &buffer[..]).unwrap();
+        assert_eq!(max_vintu128.0, deserialized.0);
     }
 }

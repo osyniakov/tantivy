@@ -274,8 +274,17 @@ impl FileSlice {
 
     /// Splits the file slice at the given offset and return two file slices.
     /// `file_slice[..split_offset]` and `file_slice[split_offset..]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `right_len` exceeds the length of the slice. Code parsing
+    /// untrusted data should check the length itself and return an error
+    /// instead of relying on this panic.
     pub fn split_from_end(self, right_len: usize) -> (FileSlice, FileSlice) {
-        let left_len = self.len() - right_len;
+        let len = self.len();
+        let Some(left_len) = len.checked_sub(right_len) else {
+            panic!("cannot split the last {right_len} bytes off a {len}-byte FileSlice");
+        };
         self.split(left_len)
     }
 
@@ -291,9 +300,17 @@ impl FileSlice {
     /// Returns a slice from the end.
     ///
     /// Equivalent to `.slice(self.len() - from_offset, self.len())`
+    ///
+    /// # Panics
+    ///
+    /// Panics if `from_offset` exceeds the length of the slice.
     #[must_use]
     pub fn slice_from_end(&self, from_offset: usize) -> FileSlice {
-        self.slice(self.len() - from_offset..self.len())
+        let len = self.len();
+        let Some(start) = len.checked_sub(from_offset) else {
+            panic!("cannot take the last {from_offset} bytes of a {len}-byte FileSlice");
+        };
+        self.slice(start..len)
     }
 
     /// Like `.slice(...)` but enforcing only the `to`
@@ -436,5 +453,23 @@ mod tests {
     #[should_panic]
     fn test_combine_range_panics() {
         let _ = combine_ranges(3..5, 1..4);
+    }
+
+    // Regression tests for a fuzzing finding: these computed `self.len() - n`
+    // unchecked, so an oversized `n` panicked with "attempt to subtract with
+    // overflow" and, in a build without overflow checks, silently wrapped into a
+    // nonsense offset instead.
+    #[test]
+    #[should_panic(expected = "cannot split the last 3 bytes off a 2-byte FileSlice")]
+    fn test_split_from_end_longer_than_slice_panics_clearly() {
+        let file_slice = FileSlice::new(Arc::new(b"ab".as_ref()));
+        let _ = file_slice.split_from_end(3);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot take the last 3 bytes of a 2-byte FileSlice")]
+    fn test_slice_from_end_longer_than_slice_panics_clearly() {
+        let file_slice = FileSlice::new(Arc::new(b"ab".as_ref()));
+        let _ = file_slice.slice_from_end(3);
     }
 }

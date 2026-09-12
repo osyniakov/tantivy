@@ -1954,4 +1954,62 @@ mod test {
         let query_with_plus = format!("+{leading}title:test{trailing}");
         test_parse_query_to_ast_helper(&query_with_plus, r#""title":test"#);
     }
+
+    // Regression tests for a fuzzing finding: a `*` that reached the `literal`
+    // parser without a field in front of it used to panic with "Exist query
+    // without a field isn't allowed". The `exists` parser starts with
+    // `multispace0`, so any whitespace before the `*` was enough to get there.
+    // A fieldless `*` is a match-all, so it now resolves to `All`.
+    #[test]
+    fn test_fieldless_star_does_not_panic() {
+        for query in ["\n*\u{0b}\u{06}", "*\u{0c}"] {
+            // The trailing control characters are still left unparsed, so the
+            // strict parser reports an error -- but an error, not a panic.
+            assert!(crate::parse_query(query).is_err());
+            let (ast, _errors) = crate::parse_query_lenient(query);
+            assert_eq!(format!("{ast:?}"), "*");
+        }
+    }
+
+    #[test]
+    fn test_star_with_leading_whitespace_is_match_all() {
+        test_parse_query_to_ast_helper(" *", "*");
+        test_parse_query_to_ast_helper("\n*", "*");
+    }
+
+    // The behaviour the fix had to leave intact.
+    #[test]
+    fn test_star_and_fielded_exists_are_unchanged() {
+        test_parse_query_to_ast_helper("*", "*");
+        test_parse_query_to_ast_helper("title:*", r#"$exists("title")"#);
+    }
+
+    // Regression test for fuzzing finding: bare `*` with space prefix no panic
+    #[test]
+    fn test_parse_bare_star_with_space_prefix_no_panic() {
+        test_parse_query_to_ast_helper(" *", "*");
+        test_parse_query_to_ast_helper("\n*", "*");
+    }
+
+    // Regression test for fuzzing finding: verify lenient parser on bare star with whitespace
+    #[test]
+    fn test_parse_lenient_bare_star_with_whitespace_no_panic() {
+        let (ast, _) = parse_to_ast_lenient(" *");
+        assert_eq!(format!("{ast:?}"), "*");
+
+        let (ast, _) = parse_to_ast_lenient("\n*");
+        assert_eq!(format!("{ast:?}"), "*");
+    }
+
+    // Regression test: verify bare star still parses correctly
+    #[test]
+    fn test_parse_bare_star_existing_behavior() {
+        test_parse_query_to_ast_helper("*", "*");
+    }
+
+    // Regression test: verify fielded exists query still parses correctly
+    #[test]
+    fn test_parse_fielded_exists_existing_behavior() {
+        test_parse_query_to_ast_helper("title:*", "$exists(\"title\")");
+    }
 }
