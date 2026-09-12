@@ -722,6 +722,21 @@ mod tests {
         assert!(dictionary.is_err());
     }
 
+    #[test]
+    fn test_dictionary_with_four_byte_index_slice_is_error() {
+        // Regression test for a fuzzing finding: this footer leaves the index
+        // slice exactly 4 bytes long, so the block reader spent all of them on
+        // the block length and then read the 1-byte compression flag off an
+        // emptied buffer, panicking in `OwnedBytes::advance`.
+        let bytes: &[u8] = &[
+            0x0a, 0x1f, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+        ];
+        let dictionary =
+            Dictionary::<MonotonicU64SSTable>::from_bytes(OwnedBytes::new(bytes.to_vec()));
+        assert!(dictionary.is_err());
+    }
+
     #[derive(Debug)]
     struct PermissionedHandle {
         bytes: OwnedBytes,

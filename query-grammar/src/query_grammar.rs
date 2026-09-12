@@ -658,6 +658,7 @@ fn set_infallible(mut inp: &str) -> JResult<&str, UserInputLeaf> {
     let mut errs = Vec::new();
     let mut first_round = true;
     loop {
+        let len_at_iteration_start = inp.len();
         let mut space_error = if first_round {
             first_round = false;
             Vec::new()
@@ -687,9 +688,6 @@ fn set_infallible(mut inp: &str) -> JResult<&str, UserInputLeaf> {
             return Ok((inp, (res, errs)));
         }
         errs.append(&mut space_error);
-        // TODO
-        // here we do the assumption term_or_phrase_infallible always consume something if the
-        // first byte is not `)` or ' '. If it did not, we would end up looping.
 
         let (rest, (delim_term, mut err)) = simple_term_infallible("]")(inp)?;
         errs.append(&mut err);
@@ -697,6 +695,25 @@ fn set_infallible(mut inp: &str) -> JResult<&str, UserInputLeaf> {
             elements.push(term);
         }
         inp = rest;
+
+        // This loop used to assume `simple_term_infallible` always consumes
+        // something when the input starts with neither `]` nor a space. It does
+        // not: some bytes (control characters, for instance) match nothing at
+        // all. Such a byte made the loop spin forever, pushing an error every
+        // pass until the process ran out of memory -- reachable from any user
+        // query containing `IN[`. Requiring progress makes that impossible
+        // regardless of what the term parser does.
+        if inp.len() == len_at_iteration_start {
+            errs.push(LenientErrorInternal {
+                pos: inp.len(),
+                message: "missing ]".to_string(),
+            });
+            let res = UserInputLeaf::Set {
+                field: None,
+                elements,
+            };
+            return Ok((inp, (res, errs)));
+        }
     }
 }
 
@@ -1975,6 +1992,29 @@ mod test {
     fn test_star_with_leading_whitespace_is_match_all() {
         test_parse_query_to_ast_helper(" *", "*");
         test_parse_query_to_ast_helper("\n*", "*");
+    }
+
+    // Regression test for a fuzzing finding: `set_infallible` assumed the term
+    // parser always consumes a byte. For these inputs it does not, so the loop
+    // span forever pushing a "missing ]" error every pass -- a 12-byte query
+    // reached 4 GB of resident memory. Terminating at all is the point here; the
+    // error count is asserted so that a future regression shows up as a failure
+    // rather than as an out-of-memory kill.
+    #[test]
+    fn test_unterminated_set_terminates() {
+        for query in ["IN\n[\u{0}\n\n\u{b}", "A\u{0}\u{1f}:IN[\n\n\u{c}\u{7f}["] {
+            let (_ast, errors) = crate::parse_query_lenient(query);
+            assert!(
+                errors.len() < 100,
+                "{query:?} produced {} errors; the non-progress guard is likely gone",
+                errors.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_set_queries_are_unchanged() {
+        test_parse_query_to_ast_helper("title: IN [a b c]", r#""title": IN ["a" "b" "c"]"#);
     }
 
     // The behaviour the fix had to leave intact.

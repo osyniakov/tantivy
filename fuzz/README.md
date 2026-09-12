@@ -68,19 +68,40 @@ diagnose as a panic.
 
 ## Known open findings
 
-These reproduce on the current tree. They are recorded here so the next person
-does not rediscover them and assume CI is simply broken. Reproduce one by
-writing the bytes to a file and replaying it:
+This reproduces on the current tree. It is recorded here so the next person does
+not rediscover it and assume CI is simply broken. Reproduce it by writing the
+bytes to a file and replaying them:
 
 ```bash
-printf '%s' 41001f3a494e5b0a0a0c7f5b | xxd -r -p > /tmp/oom
-cargo fuzz run query_parser /tmp/oom
+printf '%s' 0a00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001f1f0a02000000 \
+  | xxd -r -p > /tmp/crash
+cargo fuzz run sstable_dictionary /tmp/crash
 ```
 
-| Target(s) | Symptom | Reproducer (hex) |
+| Target | Symptom | Reproducer (hex) |
 | --- | --- | --- |
-| `query_grammar`, `query_parser` | Out of memory: >4 GB from a 12-byte query. Both reproducers contain `IN[`, the set-literal syntax, so a malformed set appears to allocate without bound. Reachable from any user-supplied query string. | `494e0a5b000a0a0b80000000000000000000000000002a3c` (24B)<br>`41001f3a494e5b0a0a0c7f5b` (12B) |
-| `sstable_dictionary` | Panic in `OwnedBytes::advance` (`ownedbytes/src/lib.rs`) via `SSTableIndex::open`: the index parser reads past the end of a short index slice. The footer itself is validated, so this is one level deeper. | `0a1f0000000100000000000000000000000000000002000000` (25B) |
+| `sstable_dictionary` | Panic indexing out of bounds in `IndexValueReader::value` (`sstable/src/value/index.rs`), reached from `SSTableIndex::open`. | `0a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001f1f0a02000000` (68B) |
+
+This one is not a local oversight, which is why it is not simply patched:
+
+- All four `ValueReader::value(idx)` impls index `self.vals[idx]` unchecked, and
+  the trait signature (`fn value(&self, idx: usize) -> &Self::Value`) cannot
+  report an error. A block whose key section decodes more entries than its value
+  section declared therefore indexes past the end.
+- `deserialize_vint_u64` (`sstable/src/value/mod.rs`) does `*data = &data[num_bytes..]`
+  with no check that `num_bytes` is in bounds.
+
+The layer was written for self-produced, trusted files. Hardening it means
+deciding on a contract: the natural fix is to add `fn num_values(&self) -> usize`
+to `ValueReader` and have the block readers refuse an out-of-range index, but
+`ValueReader` is public API, so a new required method is a breaking change.
+That is a call for the maintainers rather than something to settle inside a
+fuzzing change.
+
+Everything else found so far is fixed, with regression tests: a fieldless
+`Exists` `expect`, a `FileSlice::split_from_end` underflow, a `VInt::deserialize`
+shift overflow, an unbounded `set_infallible` loop reachable through `IN[`, and a
+truncated sstable block header.
 
 Three earlier findings — a fieldless `Exists` `expect`, a `FileSlice::split_from_end`
 underflow, and a `VInt::deserialize` shift overflow — are fixed, with regression
