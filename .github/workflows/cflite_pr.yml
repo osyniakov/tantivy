@@ -7,8 +7,10 @@
 name: ClusterFuzzLite PR fuzzing
 
 on:
+  # Every pull request, whatever it targets. Filtering on `branches: [main]`
+  # would skip a pull request stacked on another one, which is exactly where a
+  # fix for something this found tends to live.
   pull_request:
-    branches: [ main ]
 
 permissions:
   contents: read
