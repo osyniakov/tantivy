@@ -105,6 +105,22 @@ cargo fuzz run sstable_dictionary /tmp/crash
 | `tantivy-fst` (`raw/node.rs:305`), reached from `SSTableIndexV3::locate_with_key` | `Fst::new` accepts the bytes, but traversing the corrupt automaton panics. This is in the dependency, not in tantivy: the fix is for `tantivy-fst` to validate what `Fst::new` accepts (or for the v3 index to run `verify()` on open). | `0e00260001010000080000000000000000000000000000fffffffffbff002401000000000000000000000072727201027240ffffff2a07000000000000081f0a0240070000000030000000000000001f00000000000000081f0701f5f57af572727201027240ffffff2a07000000000000081f0a0240070000000030000000000000001f0000000000000010ffffffffff1e0a03000000` (151B) |
 | `BlockAddrStore` in `sstable/src/index/v3.rs` | Latent, behind the fst finding: the bit-packed block-address decoder trusts its metadata (`1 << (nbits - 1)` with `nbits == 0`, `assert!(num_bits <= 56)` on file bytes, unchecked `- range_shift`, and `.unwrap()`s that hold only for self-consistent files). This is a hot path written to be unchecked on purpose, so choosing between validating on open and checking per access is a maintainer decision. | none yet — the fst crash is hit first |
 
+### Follow-ups not yet started
+
+- The footer pattern fixed in the sstable and columnar readers (a length read
+  from the file used in `split_from_end` / `slice_from_end` unchecked) also
+  appears in the main crate: `src/termdict/mod.rs`,
+  `src/termdict/fst_termdict/termdict.rs` (`footer_size` is read from the
+  file), `src/store/footer.rs`, `src/directory/footer.rs`. None of the current
+  targets reaches them; a `Directory`-level index-open target would.
+- `cflite_batch.yml` has no `storage-repo`, so each nightly run restarts from
+  an empty corpus. Configuring one makes batch fuzzing substantially more
+  effective.
+- Scorecard's own remediation is OSS-Fuzz onboarding (a `project.yaml` in
+  `google/oss-fuzz`); `.clusterfuzzlite/build.sh` is reusable there as is.
+- Candidate new targets: `Directory`-level index open, the doc store, and JSON
+  document parsing.
+
 ## Corpus and artifacts
 
 `fuzz/corpus/` and `fuzz/artifacts/` are gitignored — no seed corpus is checked
