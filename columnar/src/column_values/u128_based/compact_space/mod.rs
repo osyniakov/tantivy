@@ -78,26 +78,46 @@ impl BinarySerializable for CompactSpace {
     }
 
     fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+        // Everything here is read from the file: the deltas walk a u128 value
+        // forward and the compact space is a u32, so a corrupt column can walk
+        // either past its end. Checking that here keeps `range_length` and
+        // `compact_end` -- which run per lookup -- free of checks, since a
+        // `CompactSpace` that exists has already been shown to add up.
+        let overflowed = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compact space ranges overflow the value space",
+            )
+        };
         let num_ranges = VInt::deserialize(reader)?.0;
         let mut ranges_mapping: Vec<RangeMapping> = vec![];
         let mut value = 0u128;
         let mut compact_start = 1u32; // 0 is reserved for `null`
         for _ in 0..num_ranges {
             let blank_delta_start = VIntU128::deserialize(reader)?.0;
-            value += blank_delta_start;
+            value = value
+                .checked_add(blank_delta_start)
+                .ok_or_else(overflowed)?;
             let blank_start = value;
 
             let blank_delta_end = VIntU128::deserialize(reader)?.0;
-            value += blank_delta_end;
+            value = value.checked_add(blank_delta_end).ok_or_else(overflowed)?;
             let blank_end = value;
 
-            let range_mapping = RangeMapping {
+            // `range_length` narrows this to a u32 and adds one, and
+            // `compact_end` then adds it to `compact_start`.
+            let range_length = u32::try_from(blank_end - blank_start)
+                .ok()
+                .and_then(|length| length.checked_add(1))
+                .ok_or_else(overflowed)?;
+            compact_start = compact_start
+                .checked_add(range_length)
+                .ok_or_else(overflowed)?;
+
+            ranges_mapping.push(RangeMapping {
                 value_range: blank_start..=blank_end,
-                compact_start,
-            };
-            let range_length = range_mapping.range_length();
-            ranges_mapping.push(range_mapping);
-            compact_start += range_length;
+                compact_start: compact_start - range_length,
+            });
         }
 
         Ok(Self { ranges_mapping })

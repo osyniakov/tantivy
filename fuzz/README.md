@@ -119,7 +119,28 @@ Fixed, each with a regression test:
 - block addresses from the index used to slice the sstable unchecked — a
   corrupt index tripped `FileSlice`'s out-of-range assert on the first lookup;
 - the v3 index trusting its footer: an fst length and a block-store length
-  past the data, and a footer shorter than 8 bytes.
+  past the data, and a footer shorter than 8 bytes;
+- the columnar column dictionary trusting its own entries: `iter_columns`
+  unwrapped the column type code, indexed the key at `len - 2` and sliced the
+  column data with the recorded range, so a corrupt entry panicked. Entries are
+  now checked, and `iter_columns` yields an `io::Result` per column;
+- `Streamer::advance` unwrapping the delta reader's error: the block checks
+  above turned a corrupt sstable block into a panic one layer up. The stream
+  now ends and parks the error for `take_error`, so `list_columns` reports the
+  corruption instead of returning a short list;
+- the columnar column decoders splitting their bytes at a length read from the
+  file: the column index length in `open_column_u64` / `open_column_u128` /
+  `open_column_bytes`, the optional and multivalued index lengths, and the
+  blockwise-linear and compact-space footer lengths;
+- `BitUnpacker::new` asserting on a bit width read from a file — the unpacker
+  cannot represent [57..63], which the writer never emits but a corrupt column
+  does. `BitUnpacker::new_checked` reports it instead, and the linear,
+  blockwise-linear and compact-space readers use it.
+
+Reading a columnar is now covered by a property test rather than only by the
+reproducers: `test_no_single_bit_flip_panics_while_reading_columns` flips every
+bit of a columnar covering each column shape in turn, and lists and opens every
+column of each. Each of the four findings above fails it.
 
 ### Still open
 
@@ -144,9 +165,16 @@ cargo fuzz run sstable_dictionary /tmp/crash
   `src/termdict/fst_termdict/termdict.rs` (`footer_size` is read from the
   file), `src/store/footer.rs`, `src/directory/footer.rs`. None of the current
   targets reaches them; a `Directory`-level index-open target would.
+- `Streamer::take_error` has one caller so far, the columnar column dictionary.
+  The term dictionary streams in the main crate (`src/termdict/`, the
+  aggregation and automaton weights) still treat a corrupt block as the end of
+  the stream, which no longer panics but does read a corrupt segment as a
+  shorter one. Threading the error out means making `advance` fallible or
+  checking `take_error` at each `while stream.advance()`, a call-site-by-call-site
+  decision rather than a mechanical change.
 - `cflite_batch.yml` has no `storage-repo`, so each nightly run restarts from
-  an empty corpus. Configuring one makes batch fuzzing substantially more
-  effective.
+  the checked-in seeds and discards whatever it discovers. Configuring one lets
+  the corpus accumulate between runs.
 - Scorecard's own remediation is OSS-Fuzz onboarding (a `project.yaml` in
   `google/oss-fuzz`); `.clusterfuzzlite/build.sh` is reusable there as is.
 - Candidate new targets: `Directory`-level index open, the doc store, and JSON
