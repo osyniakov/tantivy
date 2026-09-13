@@ -280,10 +280,17 @@ impl BinarySerializable for IPCodecParams {
         let num_vals = VIntU128::deserialize(reader)?.0 as u32;
         let num_bits = u8::deserialize(reader)?;
         let compact_space = CompactSpace::deserialize(reader)?;
+        // Read from the file, so not necessarily a width the unpacker has.
+        let bit_unpacker = BitUnpacker::new_checked(num_bits).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported bit width {num_bits} in a compact space column"),
+            )
+        })?;
 
         Ok(Self {
             compact_space,
-            bit_unpacker: BitUnpacker::new(num_bits),
+            bit_unpacker,
             min_value,
             max_value,
             num_vals,
@@ -438,10 +445,31 @@ impl ColumnValues<u128> for CompactSpaceDecompressor {
 
 impl CompactSpaceDecompressor {
     pub fn open(data: OwnedBytes) -> io::Result<CompactSpaceDecompressor> {
-        let (data_slice, footer_len_bytes) = data.split_at(data.len() - 4);
+        // The column carries its own footer length, so both lengths below are
+        // as untrusted as the rest of the bytes.
+        let Some(footer_len_offset) = data.len().checked_sub(4) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "compact space column is {} bytes, too short for its footer length",
+                    data.len()
+                ),
+            ));
+        };
+        let (data_slice, footer_len_bytes) = data.split_at(footer_len_offset);
         let footer_len = u32::deserialize(&mut &footer_len_bytes[..])?;
 
-        let data_footer = &data_slice[data_slice.len() - footer_len as usize..];
+        let Some(footer_offset) = data_slice.len().checked_sub(footer_len as usize) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "compact space column declares a {footer_len}-byte footer, but only {} bytes \
+                     precede it",
+                    data_slice.len()
+                ),
+            ));
+        };
+        let data_footer = &data_slice[footer_offset..];
         let params = IPCodecParams::deserialize(&mut &data_footer[..])?;
         let decompressor = CompactSpaceDecompressor { data, params };
 

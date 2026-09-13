@@ -12,6 +12,7 @@ use crate::column_values::{
     load_u64_based_column_values, serialize_column_values_u128, serialize_u64_based_column_values,
 };
 use crate::iterable::Iterable;
+use crate::utils::{rsplit_checked, split_checked};
 use crate::{StrColumn, Version};
 
 pub fn serialize_column_mappable_to_u128<T: MonotonicallyMappableToU128>(
@@ -44,14 +45,15 @@ pub fn open_column_u64<T: MonotonicallyMappableToU64>(
     bytes: OwnedBytes,
     format_version: Version,
 ) -> io::Result<Column<T>> {
-    let (body, column_index_num_bytes_payload) = bytes.rsplit(4);
+    let (body, column_index_num_bytes_payload) = rsplit_checked(bytes, 4, "column index length")?;
     let column_index_num_bytes = u32::from_le_bytes(
         column_index_num_bytes_payload
             .as_slice()
             .try_into()
             .unwrap(),
     );
-    let (column_index_data, column_values_data) = body.split(column_index_num_bytes as usize);
+    let (column_index_data, column_values_data) =
+        split_checked(body, column_index_num_bytes as usize, "column index")?;
     let column_index = crate::column_index::open_column_index(column_index_data, format_version)?;
     let column_values = load_u64_based_column_values(column_values_data)?;
     Ok(Column {
@@ -64,14 +66,15 @@ pub fn open_column_u128<T: MonotonicallyMappableToU128>(
     bytes: OwnedBytes,
     format_version: Version,
 ) -> io::Result<Column<T>> {
-    let (body, column_index_num_bytes_payload) = bytes.rsplit(4);
+    let (body, column_index_num_bytes_payload) = rsplit_checked(bytes, 4, "column index length")?;
     let column_index_num_bytes = u32::from_le_bytes(
         column_index_num_bytes_payload
             .as_slice()
             .try_into()
             .unwrap(),
     );
-    let (column_index_data, column_values_data) = body.split(column_index_num_bytes as usize);
+    let (column_index_data, column_values_data) =
+        split_checked(body, column_index_num_bytes as usize, "column index")?;
     let column_index = crate::column_index::open_column_index(column_index_data, format_version)?;
     let column_values = crate::column_values::open_u128_mapped(column_values_data)?;
     Ok(Column {
@@ -87,14 +90,15 @@ pub fn open_column_u128_as_compact_u64(
     bytes: OwnedBytes,
     format_version: Version,
 ) -> io::Result<Column<u64>> {
-    let (body, column_index_num_bytes_payload) = bytes.rsplit(4);
+    let (body, column_index_num_bytes_payload) = rsplit_checked(bytes, 4, "column index length")?;
     let column_index_num_bytes = u32::from_le_bytes(
         column_index_num_bytes_payload
             .as_slice()
             .try_into()
             .unwrap(),
     );
-    let (column_index_data, column_values_data) = body.split(column_index_num_bytes as usize);
+    let (column_index_data, column_values_data) =
+        split_checked(body, column_index_num_bytes as usize, "column index")?;
     let column_index = crate::column_index::open_column_index(column_index_data, format_version)?;
     let column_values = crate::column_values::open_u128_as_compact_u64(column_values_data)?;
     Ok(Column {
@@ -104,9 +108,10 @@ pub fn open_column_u128_as_compact_u64(
 }
 
 pub fn open_column_bytes(data: OwnedBytes, format_version: Version) -> io::Result<BytesColumn> {
-    let (body, dictionary_len_bytes) = data.rsplit(4);
+    let (body, dictionary_len_bytes) = rsplit_checked(data, 4, "term dictionary length")?;
     let dictionary_len = u32::from_le_bytes(dictionary_len_bytes.as_slice().try_into().unwrap());
-    let (dictionary_bytes, column_bytes) = body.split(dictionary_len as usize);
+    let (dictionary_bytes, column_bytes) =
+        split_checked(body, dictionary_len as usize, "term dictionary")?;
     let dictionary = Arc::new(Dictionary::from_bytes(dictionary_bytes)?);
     let term_ord_column = crate::column::open_column_u64::<u64>(column_bytes, format_version)?;
     Ok(BytesColumn {

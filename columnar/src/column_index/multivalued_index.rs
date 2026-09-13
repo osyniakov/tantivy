@@ -11,6 +11,7 @@ use crate::column_values::{
     CodecType, ColumnValues, load_u64_based_column_values, serialize_u64_based_column_values,
 };
 use crate::iterable::Iterable;
+use crate::utils::{rsplit_checked, split_checked};
 use crate::{DocId, RowId, Version};
 
 pub struct SerializableMultivalueIndex<'a> {
@@ -56,11 +57,15 @@ pub fn open_multivalued_index(
             }))
         }
         Version::V2 => {
-            let (body_bytes, optional_index_len) = bytes.rsplit(4);
+            let (body_bytes, optional_index_len) =
+                rsplit_checked(bytes, 4, "multivalued index optional index length")?;
             let optional_index_len =
                 u32::from_le_bytes(optional_index_len.as_slice().try_into().unwrap());
-            let (optional_index_bytes, start_index_bytes) =
-                body_bytes.split(optional_index_len as usize);
+            let (optional_index_bytes, start_index_bytes) = split_checked(
+                body_bytes,
+                optional_index_len as usize,
+                "multivalued index optional index",
+            )?;
             let optional_index = open_optional_index(optional_index_bytes)?;
             let start_index_column: Arc<dyn ColumnValues<RowId>> =
                 load_u64_based_column_values(start_index_bytes)?;

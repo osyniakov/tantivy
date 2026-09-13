@@ -41,7 +41,8 @@ impl FastFieldReaders {
 
     pub(crate) fn space_usage(&self) -> io::Result<PerFieldSpaceUsage> {
         let mut per_field_usages: Vec<FieldUsage> = Default::default();
-        for (mut field_name, column_handle) in self.columnar.iter_columns()? {
+        for column in self.columnar.iter_columns()? {
+            let (mut field_name, column_handle) = column?;
             json_path_sep_to_dot(&mut field_name);
             let space_usage = column_handle.space_usage()?;
             let mut field_usage = FieldUsage::empty(field_name);

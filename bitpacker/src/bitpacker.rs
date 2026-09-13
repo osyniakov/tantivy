@@ -76,7 +76,7 @@ impl BitUnpacker {
     /// For this reason, values of `num_bits` between
     /// [57..63] are forbidden.
     pub fn new(num_bits: u8) -> BitUnpacker {
-        assert!(num_bits <= 7 * 8 || num_bits == 64);
+        assert!(Self::is_supported_num_bits(num_bits));
         let mask: u64 = if num_bits == 64 {
             !0u64
         } else {
@@ -85,6 +85,26 @@ impl BitUnpacker {
         BitUnpacker {
             num_bits: usize::from(num_bits),
             mask,
+        }
+    }
+
+    /// Whether `new` accepts this bit width: the unaligned 8-byte read makes
+    /// [57..63] unrepresentable.
+    pub fn is_supported_num_bits(num_bits: u8) -> bool {
+        num_bits <= 7 * 8 || num_bits == 64
+    }
+
+    /// Like [`BitUnpacker::new`], but returns `None` instead of panicking on a
+    /// bit width the unpacker cannot represent.
+    ///
+    /// A bit width written by [`BitPacker`] is always one of the supported
+    /// ones, so `new` is right for those. Use this when the width was read back
+    /// out of a file, where it is untrusted.
+    pub fn new_checked(num_bits: u8) -> Option<BitUnpacker> {
+        if Self::is_supported_num_bits(num_bits) {
+            Some(Self::new(num_bits))
+        } else {
+            None
         }
     }
 

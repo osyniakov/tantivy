@@ -29,10 +29,17 @@ impl BinarySerializable for Block {
 
     fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
         let line = Line::deserialize(reader)?;
+        // Read from the file, so not necessarily a width the unpacker has.
         let bit_width = u8::deserialize(reader)?;
+        let bit_unpacker = BitUnpacker::new_checked(bit_width).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported bit width {bit_width} in a blockwise linear column"),
+            )
+        })?;
         Ok(Block {
             line,
-            bit_unpacker: BitUnpacker::new(bit_width),
+            bit_unpacker,
             data_start_offset: 0,
         })
     }
@@ -174,8 +181,28 @@ impl ColumnCodec<u64> for BlockwiseLinearCodec {
 
     fn load(mut bytes: OwnedBytes) -> io::Result<Self::ColumnValues> {
         let stats = ColumnStats::deserialize(&mut bytes)?;
-        let footer_len: u32 = (&bytes[bytes.len() - 4..]).deserialize()?;
-        let footer_offset = bytes.len() - 4 - footer_len as usize;
+        // Both lengths below are read from the column: a four-byte footer
+        // length that is not there, or one longer than the column itself, is
+        // corruption rather than something to index with.
+        let Some(footer_len_offset) = bytes.len().checked_sub(4) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "blockwise linear column is {} bytes, too short for its footer length",
+                    bytes.len()
+                ),
+            ));
+        };
+        let footer_len: u32 = (&bytes[footer_len_offset..]).deserialize()?;
+        let Some(footer_offset) = footer_len_offset.checked_sub(footer_len as usize) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "blockwise linear column declares a {footer_len}-byte footer, but only \
+                     {footer_len_offset} bytes precede it"
+                ),
+            ));
+        };
         let (data, mut footer) = bytes.split(footer_offset);
         let num_blocks = compute_num_blocks(stats.num_rows);
         let mut blocks: Vec<Block> = iter::repeat_with(|| Block::deserialize(&mut footer))

@@ -218,23 +218,23 @@ impl TopHitsAggregationReq {
             .doc_value_fields
             .iter()
             .map(|field| {
-                if !field.contains('*')
-                    && reader
-                        .iter_columns()?
-                        .any(|(name, _)| name.as_str() == field)
-                {
-                    return Ok(vec![field.to_owned()]);
+                if !field.contains('*') {
+                    for column in reader.iter_columns()? {
+                        if column?.0.as_str() == field {
+                            return Ok(vec![field.to_owned()]);
+                        }
+                    }
                 }
 
                 let pattern = globbed_string_to_regex(field)?;
-                let fields = reader
-                    .iter_columns()?
-                    .map(|(name, _)| {
-                        // normalize path from internal fast field repr
-                        name.replace(JSON_PATH_SEGMENT_SEP_STR, ".")
-                    })
-                    .filter(|name| pattern.is_match(name))
-                    .collect::<Vec<_>>();
+                let mut fields = Vec::new();
+                for column in reader.iter_columns()? {
+                    // normalize path from internal fast field repr
+                    let name = column?.0.replace(JSON_PATH_SEGMENT_SEP_STR, ".");
+                    if pattern.is_match(&name) {
+                        fields.push(name);
+                    }
+                }
                 assert!(
                     !fields.is_empty(),
                     "No fields matched the glob '{field}' in docvalue_fields"

@@ -11,6 +11,7 @@ use set_block::{
 };
 
 use crate::iterable::Iterable;
+use crate::utils::rsplit_checked;
 use crate::{DocId, RowId};
 
 /// The threshold for for number of elements after which we switch to dense block encoding.
@@ -596,13 +597,18 @@ fn deserialize_optional_index_block_metadatas(
 }
 
 pub fn open_optional_index(bytes: OwnedBytes) -> io::Result<OptionalIndex> {
-    let (mut bytes, num_non_empty_blocks_bytes) = bytes.rsplit(2);
+    let (mut bytes, num_non_empty_blocks_bytes) =
+        rsplit_checked(bytes, 2, "optional index block count")?;
     let num_non_empty_block_bytes =
         u16::from_le_bytes(num_non_empty_blocks_bytes.as_slice().try_into().unwrap());
     let num_docs = VInt::deserialize_u64(&mut bytes)? as u32;
     let block_metas_num_bytes =
         num_non_empty_block_bytes as usize * SERIALIZED_BLOCK_META_NUM_BYTES;
-    let (block_data, block_metas) = bytes.rsplit(block_metas_num_bytes);
+    let (block_data, block_metas) = rsplit_checked(
+        bytes,
+        block_metas_num_bytes,
+        "optional index block metadata",
+    )?;
     let (block_metas, num_non_null_docs) =
         deserialize_optional_index_block_metadatas(block_metas.as_slice(), num_docs);
     let optional_index = OptionalIndex {

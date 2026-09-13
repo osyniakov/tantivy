@@ -64,11 +64,16 @@ impl BinarySerializable for LinearParams {
 
     fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
         let line = Line::deserialize(reader)?;
+        // The bit width comes from the file: a value the unpacker cannot
+        // represent is corruption, not a width to assert on.
         let bit_width = u8::deserialize(reader)?;
-        Ok(Self {
-            line,
-            bit_unpacker: BitUnpacker::new(bit_width),
-        })
+        let bit_unpacker = BitUnpacker::new_checked(bit_width).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported bit width {bit_width} in a linear column"),
+            )
+        })?;
+        Ok(Self { line, bit_unpacker })
     }
 }
 
