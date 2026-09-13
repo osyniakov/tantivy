@@ -79,10 +79,12 @@ So both targets ship a seed corpus, in `fuzz/seeds/<target>/`. It is small and
 checked in, and `.clusterfuzzlite/build.sh` packs each directory into
 `$OUT/<target>_seed_corpus.zip`, which is where libFuzzer looks for it.
 
-Locally, pass the directory as the corpus:
+Locally, pass the seeds as a second corpus directory. libFuzzer writes what it
+discovers into the *first* one, so this keeps the checked-in seeds read-only
+and the new units in the gitignored corpus:
 
 ```bash
-cargo fuzz run columnar_reader fuzz/seeds/columnar_reader
+cargo fuzz run columnar_reader fuzz/corpus/columnar_reader fuzz/seeds/columnar_reader
 ```
 
 The seeds are generated rather than hand-written, so they stay valid as the
@@ -135,12 +137,25 @@ Fixed, each with a regression test:
 - `BitUnpacker::new` asserting on a bit width read from a file — the unpacker
   cannot represent [57..63], which the writer never emits but a corrupt column
   does. `BitUnpacker::new_checked` reports it instead, and the linear,
-  blockwise-linear and compact-space readers use it.
+  blockwise-linear and compact-space readers use it;
+- `ColumnStats::deserialize` multiplying the stored amplitude by the stored gcd
+  and adding the stored minimum, both unchecked;
+- `CompactSpace::deserialize` walking its ranges with unchecked additions: the
+  u128 value the deltas advance, the u32 range length it narrows to, and the
+  compact-space cursor could each overflow. They are checked once on
+  deserialize, so `range_length` and `compact_end`, which run per lookup, stay
+  as they were.
 
 Reading a columnar is now covered by a property test rather than only by the
 reproducers: `test_no_single_bit_flip_panics_while_reading_columns` flips every
 bit of a columnar covering each column shape in turn, and lists and opens every
-column of each. Each of the four findings above fails it.
+column of each. The first four findings above fail it; the last two are deeper
+than a single flipped bit reaches and were found by the target itself, which is
+the argument for the seed corpus.
+
+With all of them fixed, `columnar_reader` runs its seeds for 300 seconds
+(7.6M executions) without a crash, at 1222 edges against the 109 it reached
+blind.
 
 ### Still open
 
