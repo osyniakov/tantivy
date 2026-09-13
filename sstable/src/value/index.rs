@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::value::{ValueReader, ValueWriter, deserialize_vint_u64};
+use crate::value::{ValueReader, ValueWriter, deserialize_vint_u64, invalid_data};
 use crate::{BlockAddr, vint};
 
 #[derive(Default)]
@@ -16,18 +16,29 @@ impl ValueReader for IndexValueReader {
         &self.vals[idx]
     }
 
+    fn num_values(&self) -> Option<usize> {
+        Some(self.vals.len())
+    }
+
     fn load(&mut self, mut data: &[u8]) -> io::Result<usize> {
         let original_num_bytes = data.len();
-        let num_vals = deserialize_vint_u64(&mut data) as usize;
+        let num_vals = deserialize_vint_u64(&mut data)? as usize;
         self.vals.clear();
         let mut first_ordinal = 0u64;
-        let mut prev_start = deserialize_vint_u64(&mut data) as usize;
+        let mut prev_start = deserialize_vint_u64(&mut data)? as usize;
+        // Every field below comes out of the block itself, so a corrupt block
+        // can announce any count or any delta: each read fails once the data
+        // runs out, and the additions are checked rather than trusted.
         for _ in 0..num_vals {
-            let len = deserialize_vint_u64(&mut data);
-            let delta_ordinal = deserialize_vint_u64(&mut data);
+            let len = deserialize_vint_u64(&mut data)?;
+            let delta_ordinal = deserialize_vint_u64(&mut data)?;
 
-            first_ordinal += delta_ordinal;
-            let end = prev_start + len as usize;
+            first_ordinal = first_ordinal
+                .checked_add(delta_ordinal)
+                .ok_or_else(|| invalid_data("sstable index ordinal overflows"))?;
+            let end = prev_start
+                .checked_add(len as usize)
+                .ok_or_else(|| invalid_data("sstable index block offset overflows"))?;
             self.vals.push(BlockAddr {
                 byte_range: prev_start..end,
                 first_ordinal,

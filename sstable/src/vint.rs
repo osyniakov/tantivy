@@ -1,4 +1,7 @@
-const CONTINUE_BIT: u8 = 128u8;
+pub(crate) const CONTINUE_BIT: u8 = 128u8;
+
+/// Longest encoding of a `u64`: 64 bits at 7 per byte.
+pub(crate) const MAX_U64_VINT_LEN: usize = 10;
 
 pub fn serialize(mut val: u64, buffer: &mut [u8]) -> usize {
     for (i, b) in buffer.iter_mut().enumerate() {
@@ -28,7 +31,12 @@ pub fn deserialize_read(buf: &[u8]) -> (usize, u64) {
 
     for &b in buf {
         consumed += 1;
-        result |= u64::from(b % 128u8) << shift;
+        // Nothing fits past 64 bits. Keep consuming so the caller sees the
+        // whole (over-long) encoding and can reject it, but stop shifting:
+        // a corrupt encoding used to overflow the shift here and panic.
+        if shift < 64 {
+            result |= u64::from(b % 128u8) << shift;
+        }
         if b < CONTINUE_BIT {
             break;
         }

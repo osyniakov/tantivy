@@ -95,6 +95,17 @@ impl BlockReader {
             if block_len <= 1 {
                 return Ok(false);
             }
+            // A real block header carries a 1-byte compression flag after the
+            // length. A stream that ends right here is truncated: reading the
+            // flag off the emptied buffer panicked in `OwnedBytes::advance`.
+            // (A trailing length of 0 or 1 is the normal end-of-stream marker
+            // and has already returned above, so this does not reject it.)
+            if self.reader.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to read block compression flag",
+                ));
+            }
             let compress = self.reader.read_u8();
             let block_len = block_len - 1;
 

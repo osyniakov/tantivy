@@ -132,6 +132,7 @@ where
             term_ord: first_term.checked_sub(1),
             lower_bound: self.lower,
             upper_bound: self.upper,
+            error: None,
             _lifetime: std::marker::PhantomData,
         })
     }
@@ -174,6 +175,11 @@ where
     term_ord: Option<TermOrdinal>,
     lower_bound: Bound<Vec<u8>>,
     upper_bound: Bound<Vec<u8>>,
+    /// Set when `advance` stopped because the underlying blocks are corrupt,
+    /// rather than because the stream ended. `advance` returns `bool`, and the
+    /// callers of a term stream are written as `while stream.advance()`, so the
+    /// error is parked here for the callers that want to tell the two apart.
+    error: Option<io::Error>,
     // this field is used to please the type-interface of a dictionary in tantivy
     _lifetime: std::marker::PhantomData<&'a ()>,
 }
@@ -190,6 +196,7 @@ where TSSTable: SSTable
             term_ord: None,
             lower_bound: Bound::Unbounded,
             upper_bound: Bound::Unbounded,
+            error: None,
             _lifetime: std::marker::PhantomData,
         }
     }
@@ -201,11 +208,36 @@ where
     A::State: Clone,
     TSSTable: SSTable,
 {
+    /// Advances the underlying delta reader, recording an error instead of
+    /// panicking on it.
+    ///
+    /// The blocks are read from the file, so a corrupt or hostile sstable
+    /// surfaces here as an `Err`. Treat it as the end of the stream: the
+    /// caller sees `advance() == false` and can ask `take_error` why.
+    fn advance_delta_reader(&mut self) -> bool {
+        match self.delta_reader.advance() {
+            Ok(has_next) => has_next,
+            Err(error) => {
+                self.error = Some(error);
+                false
+            }
+        }
+    }
+
+    /// Takes the error that stopped the stream, if it stopped on one.
+    ///
+    /// `None` after a stream that ran to its end, which is the ordinary case.
+    /// A caller that must not silently treat a corrupt sstable as an empty one
+    /// checks this once `advance` has returned `false`.
+    pub fn take_error(&mut self) -> Option<io::Error> {
+        self.error.take()
+    }
+
     /// Advance position the stream on the next item.
     /// Before the first call to `.advance()`, the stream
     /// is an uninitialized state.
     pub fn advance(&mut self) -> bool {
-        while self.delta_reader.advance().unwrap() {
+        while self.advance_delta_reader() {
             // An automaton prunes whole blocks, so the ordinal is not simply the previous one
             // plus one: on entering a new slice it jumps to that slice's first term ordinal.
             // Counting alone would report a term's position among the blocks actually scanned.

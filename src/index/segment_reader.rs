@@ -396,7 +396,8 @@ impl SegmentReader {
             .fast_fields()
             .columnar()
             .iter_columns()?
-            .map(|(mut field_name, handle)| {
+            .map(|column| {
+                let (mut field_name, handle) = column?;
                 json_path_sep_to_dot(&mut field_name);
                 // map to canonical path, to avoid similar but different entries.
                 // Eventually we should just accept '.' separated for all cases.
@@ -405,7 +406,7 @@ impl SegmentReader {
                     .unwrap_or(&field_name)
                     .to_string();
                 let stored = is_field_stored(&field_name, &self.schema);
-                FieldMetadata {
+                Ok(FieldMetadata {
                     field_name,
                     typ: Type::from(handle.column_type()),
                     stored,
@@ -413,9 +414,9 @@ impl SegmentReader {
                     term_dictionary_size: None,
                     postings_size: None,
                     positions_size: None,
-                }
+                })
             })
-            .collect();
+            .collect::<std::io::Result<Vec<FieldMetadata>>>()?;
         let merged_field_metadatas: Vec<FieldMetadata> =
             merge_field_meta_data(vec![indexed_fields, fast_fields]);
         Ok(merged_field_metadatas)

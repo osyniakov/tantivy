@@ -78,26 +78,46 @@ impl BinarySerializable for CompactSpace {
     }
 
     fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+        // Everything here is read from the file: the deltas walk a u128 value
+        // forward and the compact space is a u32, so a corrupt column can walk
+        // either past its end. Checking that here keeps `range_length` and
+        // `compact_end` -- which run per lookup -- free of checks, since a
+        // `CompactSpace` that exists has already been shown to add up.
+        let overflowed = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compact space ranges overflow the value space",
+            )
+        };
         let num_ranges = VInt::deserialize(reader)?.0;
         let mut ranges_mapping: Vec<RangeMapping> = vec![];
         let mut value = 0u128;
         let mut compact_start = 1u32; // 0 is reserved for `null`
         for _ in 0..num_ranges {
             let blank_delta_start = VIntU128::deserialize(reader)?.0;
-            value += blank_delta_start;
+            value = value
+                .checked_add(blank_delta_start)
+                .ok_or_else(overflowed)?;
             let blank_start = value;
 
             let blank_delta_end = VIntU128::deserialize(reader)?.0;
-            value += blank_delta_end;
+            value = value.checked_add(blank_delta_end).ok_or_else(overflowed)?;
             let blank_end = value;
 
-            let range_mapping = RangeMapping {
+            // `range_length` narrows this to a u32 and adds one, and
+            // `compact_end` then adds it to `compact_start`.
+            let range_length = u32::try_from(blank_end - blank_start)
+                .ok()
+                .and_then(|length| length.checked_add(1))
+                .ok_or_else(overflowed)?;
+            compact_start = compact_start
+                .checked_add(range_length)
+                .ok_or_else(overflowed)?;
+
+            ranges_mapping.push(RangeMapping {
                 value_range: blank_start..=blank_end,
-                compact_start,
-            };
-            let range_length = range_mapping.range_length();
-            ranges_mapping.push(range_mapping);
-            compact_start += range_length;
+                compact_start: compact_start - range_length,
+            });
         }
 
         Ok(Self { ranges_mapping })
@@ -280,10 +300,17 @@ impl BinarySerializable for IPCodecParams {
         let num_vals = VIntU128::deserialize(reader)?.0 as u32;
         let num_bits = u8::deserialize(reader)?;
         let compact_space = CompactSpace::deserialize(reader)?;
+        // Read from the file, so not necessarily a width the unpacker has.
+        let bit_unpacker = BitUnpacker::new_checked(num_bits).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported bit width {num_bits} in a compact space column"),
+            )
+        })?;
 
         Ok(Self {
             compact_space,
-            bit_unpacker: BitUnpacker::new(num_bits),
+            bit_unpacker,
             min_value,
             max_value,
             num_vals,
@@ -438,10 +465,31 @@ impl ColumnValues<u128> for CompactSpaceDecompressor {
 
 impl CompactSpaceDecompressor {
     pub fn open(data: OwnedBytes) -> io::Result<CompactSpaceDecompressor> {
-        let (data_slice, footer_len_bytes) = data.split_at(data.len() - 4);
+        // The column carries its own footer length, so both lengths below are
+        // as untrusted as the rest of the bytes.
+        let Some(footer_len_offset) = data.len().checked_sub(4) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "compact space column is {} bytes, too short for its footer length",
+                    data.len()
+                ),
+            ));
+        };
+        let (data_slice, footer_len_bytes) = data.split_at(footer_len_offset);
         let footer_len = u32::deserialize(&mut &footer_len_bytes[..])?;
 
-        let data_footer = &data_slice[data_slice.len() - footer_len as usize..];
+        let Some(footer_offset) = data_slice.len().checked_sub(footer_len as usize) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "compact space column declares a {footer_len}-byte footer, but only {} bytes \
+                     precede it",
+                    data_slice.len()
+                ),
+            ));
+        };
+        let data_footer = &data_slice[footer_offset..];
         let params = IPCodecParams::deserialize(&mut &data_footer[..])?;
         let decompressor = CompactSpaceDecompressor { data, params };
 

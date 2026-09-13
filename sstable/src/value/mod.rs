@@ -25,6 +25,18 @@ pub trait ValueReader: Default {
     ///
     /// Returns the number of bytes that were read.
     fn load(&mut self, data: &[u8]) -> io::Result<usize>;
+
+    /// Number of values in the block loaded by the last call to `load`, when
+    /// the reader knows it.
+    ///
+    /// The block readers use it to reject a corrupt block whose key section
+    /// holds more entries than its value section declared; without it, `value`
+    /// would be asked for an index that does not exist. Returns `None` by
+    /// default, so existing implementors are unaffected and simply keep the
+    /// old behaviour.
+    fn num_values(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// `ValueWriter` is a trait to make it possible to write blocks
@@ -46,10 +58,43 @@ pub trait ValueWriter: Default {
     fn clear(&mut self);
 }
 
-fn deserialize_vint_u64(data: &mut &[u8]) -> u64 {
+pub(crate) fn invalid_data(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+/// Reads one vint, rejecting input that ends before the value does and
+/// encodings longer than a `u64` can need.
+///
+/// `deserialize_read` alone reports neither: on an exhausted buffer it returns
+/// `(0, 0)`, so a truncated block used to decode as a run of zeros, and an
+/// over-long encoding used to overflow its shift.
+fn deserialize_vint_u64(data: &mut &[u8]) -> io::Result<u64> {
     let (num_bytes, val) = super::vint::deserialize_read(data);
+    if num_bytes == 0 || data[num_bytes - 1] >= super::vint::CONTINUE_BIT {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "sstable value block ends in the middle of a value",
+        ));
+    }
+    if num_bytes > super::vint::MAX_U64_VINT_LEN {
+        return Err(invalid_data(
+            "sstable value block holds a vint longer than a u64",
+        ));
+    }
     *data = &data[num_bytes..];
-    val
+    Ok(val)
+}
+
+/// Reads one little-endian `u32`, or fails if fewer than 4 bytes remain.
+pub(crate) fn read_u32(data: &mut &[u8]) -> io::Result<u32> {
+    let Some((bytes, rest)) = data.split_first_chunk::<4>() else {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "sstable value block ends in the middle of a u32",
+        ));
+    };
+    *data = rest;
+    Ok(u32::from_le_bytes(*bytes))
 }
 
 #[cfg(test)]

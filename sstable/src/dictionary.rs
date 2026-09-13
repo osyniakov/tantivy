@@ -3,12 +3,12 @@
 use std::cmp::Ordering;
 use std::io;
 use std::marker::PhantomData;
-use std::ops::{Bound, RangeBounds};
+use std::ops::{Bound, Range, RangeBounds};
 use std::sync::Arc;
 
 use common::bounds::{TransformBound, transform_bound_inner_res};
 use common::file_slice::FileSlice;
-use common::{BinarySerializable, ByteCount, OwnedBytes};
+use common::{BinarySerializable, ByteCount, HasLen, OwnedBytes};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use tantivy_fst::Automaton;
@@ -88,11 +88,30 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         Ok(TSSTable::writer(wrt))
     }
 
+    /// Bounds-checks a block address before it is used to slice the sstable.
+    ///
+    /// The index is parsed from the file, so a corrupt one can point anywhere.
+    /// `FileSlice` treats an out-of-range slice as a programming error and
+    /// asserts, which is the wrong failure for untrusted data.
+    fn block_range(&self, block_addr: &BlockAddr) -> io::Result<Range<usize>> {
+        let range = block_addr.byte_range.clone();
+        let len = self.sstable_slice.len();
+        if range.start > range.end || range.end > len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("sstable index points at bytes {range:?} of a {len}-byte sstable"),
+            ));
+        }
+        Ok(range)
+    }
+
     pub(crate) fn sstable_reader_block(
         &self,
         block_addr: BlockAddr,
     ) -> io::Result<Reader<TSSTable::ValueReader>> {
-        let data = self.sstable_slice.read_bytes_slice(block_addr.byte_range)?;
+        let data = self
+            .sstable_slice
+            .read_bytes_slice(self.block_range(&block_addr)?)?;
         Ok(TSSTable::reader(data))
     }
 
@@ -120,7 +139,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                     async move {
                         let bytes = self
                             .sstable_slice
-                            .read_bytes_slice_async(block_addr.byte_range)
+                            .read_bytes_slice_async(self.block_range(&block_addr)?)
                             .await?;
                         io::Result::Ok((bytes, first_ordinal))
                     }
@@ -151,7 +170,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                 .map(|block_addr| {
                     let first_ordinal = block_addr.first_ordinal;
                     self.sstable_slice
-                        .read_bytes_slice(block_addr.byte_range)
+                        .read_bytes_slice(self.block_range(&block_addr)?)
                         .map(|bytes| (bytes, first_ordinal))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -163,7 +182,9 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         &self,
         block_addr: BlockAddr,
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
-        let data = self.sstable_slice.read_bytes_slice(block_addr.byte_range)?;
+        let data = self
+            .sstable_slice
+            .read_bytes_slice(self.block_range(&block_addr)?)?;
         Ok(TSSTable::delta_reader(data))
     }
 
@@ -173,7 +194,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
         let data = self
             .sstable_slice
-            .read_bytes_slice_async(block_addr.byte_range)
+            .read_bytes_slice_async(self.block_range(&block_addr)?)
             .await?;
         Ok(TSSTable::delta_reader(data))
     }
@@ -246,7 +267,23 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             .map(|block_addr| Bound::Excluded(block_addr.byte_range.end))
             .unwrap_or(Bound::Unbounded);
 
-        self.sstable_slice.slice((start_bound, end_bound))
+        // Both bounds come from the index, which is parsed from the file, so a
+        // corrupt index can point past the sstable. `slice` treats that as a
+        // programming error and panics; an empty slice is the right answer for
+        // untrusted data, and matches the "nothing there" returns above.
+        let len = self.sstable_slice.len();
+        let start = match start_bound {
+            Bound::Included(start) => start,
+            _ => 0,
+        };
+        let end = match end_bound {
+            Bound::Excluded(end) => end,
+            _ => len,
+        };
+        if start > end || end > len {
+            return FileSlice::empty();
+        }
+        self.sstable_slice.slice(start..end)
     }
 
     fn get_block_iterator_for_range_and_automaton<'a>(
@@ -274,7 +311,11 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             .filter(move |(block_id, _)| block_range.contains(block_id))
             .map(|(_, block_addr)| block_addr)
             .coalesce(move |first, second| {
-                if first.byte_range.end + merge_holes_under_bytes >= second.byte_range.start {
+                // `byte_range.end` is read from the index; saturate so a corrupt
+                // value cannot overflow the addition.
+                if first.byte_range.end.saturating_add(merge_holes_under_bytes)
+                    >= second.byte_range.start
+                {
                     Ok(BlockAddr {
                         first_ordinal: first.first_ordinal,
                         byte_range: first.byte_range.start..second.byte_range.end,
@@ -287,12 +328,40 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     /// Opens a `TermDictionary`.
     pub fn open(term_dictionary_file: FileSlice) -> io::Result<Self> {
+        // Index offset (u64), number of terms (u64), then the format version (u32).
+        const FOOTER_NUM_BYTES: usize = 2 * std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
+
         let num_bytes = term_dictionary_file.num_bytes();
-        let (main_slice, footer_len_slice) = term_dictionary_file.split_from_end(20);
+        // The footer is taken off the end, so anything shorter than the footer
+        // has to be rejected before splitting: the bytes are untrusted and the
+        // split would otherwise underflow.
+        if term_dictionary_file.len() < FOOTER_NUM_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "sstable is too short: {} bytes, need at least {FOOTER_NUM_BYTES} for the \
+                     footer",
+                    term_dictionary_file.len()
+                ),
+            ));
+        }
+        let (main_slice, footer_len_slice) = term_dictionary_file.split_from_end(FOOTER_NUM_BYTES);
         let mut footer_len_bytes: OwnedBytes = footer_len_slice.read_bytes()?;
         let index_offset = u64::deserialize(&mut footer_len_bytes)?;
         let num_terms = u64::deserialize(&mut footer_len_bytes)?;
         let version = u32::deserialize(&mut footer_len_bytes)?;
+
+        // `index_offset` was read from that footer, so it is untrusted too and
+        // `split` would panic on an offset past the end of the body.
+        if index_offset > main_slice.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "sstable index offset {index_offset} exceeds the {}-byte body",
+                    main_slice.len()
+                ),
+            ));
+        }
         let (sstable_slice, index_slice) = main_slice.split(index_offset as usize);
         let sstable_index_bytes = index_slice.read_bytes()?;
 
@@ -667,6 +736,106 @@ mod tests {
     use super::Dictionary;
     use crate::dictionary::TermOrdHit;
     use crate::{MonotonicU64SSTable, TermOrdinal};
+
+    // Regression tests for a fuzzing finding: `Dictionary::from_bytes(b"")` used
+    // to panic with a subtraction overflow while splitting the footer off the
+    // end, instead of reporting the buffer as malformed.
+    #[test]
+    fn test_dictionary_from_truncated_bytes_is_error() {
+        let footer_num_bytes = 2 * std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
+        for len in 0..footer_num_bytes {
+            let bytes = OwnedBytes::new(vec![0u8; len]);
+            assert!(
+                Dictionary::<MonotonicU64SSTable>::from_bytes(bytes).is_err(),
+                "a {len}-byte buffer cannot hold the {footer_num_bytes}-byte footer and must be \
+                 rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dictionary_with_out_of_bounds_index_offset_is_error() {
+        // Nothing but a footer, whose index offset points far past the body. All
+        // 0xff, so this does not depend on the field's endianness.
+        let mut bytes = vec![0u8; 2 * std::mem::size_of::<u64>() + std::mem::size_of::<u32>()];
+        bytes[0..std::mem::size_of::<u64>()].fill(0xff);
+        let dictionary = Dictionary::<MonotonicU64SSTable>::from_bytes(OwnedBytes::new(bytes));
+        assert!(dictionary.is_err());
+    }
+
+    #[test]
+    fn test_dictionary_with_four_byte_index_slice_is_error() {
+        // Regression test for a fuzzing finding: this footer leaves the index
+        // slice exactly 4 bytes long, so the block reader spent all of them on
+        // the block length and then read the 1-byte compression flag off an
+        // emptied buffer, panicking in `OwnedBytes::advance`.
+        let bytes: &[u8] = &[
+            0x0a, 0x1f, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+        ];
+        let dictionary =
+            Dictionary::<MonotonicU64SSTable>::from_bytes(OwnedBytes::new(bytes.to_vec()));
+        assert!(dictionary.is_err());
+    }
+
+    #[test]
+    fn test_dictionary_with_more_index_keys_than_values_is_error() {
+        // Regression test for a fuzzing finding: the index block in this file
+        // holds more keys than its value section declares, which used to make
+        // `IndexValueReader::value` index out of bounds.
+        let mut bytes = vec![0x0a];
+        bytes.extend_from_slice(&[0u8; 60]);
+        bytes.extend_from_slice(&[0x1f, 0x1f, 0x0a, 0x02, 0x00, 0x00, 0x00]);
+        assert_eq!(bytes.len(), 68);
+        let dictionary = Dictionary::<MonotonicU64SSTable>::from_bytes(OwnedBytes::new(bytes));
+        assert!(dictionary.is_err());
+    }
+
+    #[test]
+    fn test_dictionary_index_pointing_outside_sstable_is_error() {
+        // Regression test for a fuzzing finding: this file's index parses, but
+        // the block it describes lies past the end of the sstable body. Looking
+        // a key up used to trip `FileSlice`'s out-of-range assert.
+        let bytes: Vec<u8> = vec![
+            0x0a, 0x00, 0x00, 0x00, 0xfe, 0x01, 0x00, 0xbf, 0xfc, 0xff, 0xf9, 0x00, 0x1f, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f, 0x1f,
+            0x0a, 0x02, 0x00, 0x00, 0x00,
+        ];
+        let dictionary =
+            Dictionary::<MonotonicU64SSTable>::from_bytes(OwnedBytes::new(bytes)).unwrap();
+        assert!(dictionary.get(b"").is_err());
+    }
+
+    #[test]
+    fn test_dictionary_v3_index_with_oversized_fst_length_is_error() {
+        // Regression test for a fuzzing finding: a v3 footer whose fst length
+        // exceeds the index used to panic in `OwnedBytes::split`.
+        let hex = "0a00000000070100ffffffffffff000000000030001f0000001f1f0a1f00000000000000000000000000\
+                   00001f1f0a03000000";
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(bytes.len(), 51);
+        assert!(Dictionary::<MonotonicU64SSTable>::from_bytes(OwnedBytes::new(bytes)).is_err());
+    }
+
+    #[test]
+    fn test_dictionary_index_with_oversized_key_prefix_is_error() {
+        // Regression test for a fuzzing finding: a key header in the index
+        // block claims a prefix far longer than the previous key, which made
+        // the reader try to allocate a key buffer of several exabytes.
+        let hex = "1f00000099040019000000000a00000701f5f5f5f5f5f5f5f5f5000000000000000000000000001f02\
+                   001fb83000001f0a001fb80a02001fb80a0200bffcfff900000000000000000020000000000000000\
+                   2000000";
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(bytes.len(), 85);
+        assert!(Dictionary::<MonotonicU64SSTable>::from_bytes(OwnedBytes::new(bytes)).is_err());
+    }
 
     #[derive(Debug)]
     struct PermissionedHandle {

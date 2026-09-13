@@ -658,6 +658,7 @@ fn set_infallible(mut inp: &str) -> JResult<&str, UserInputLeaf> {
     let mut errs = Vec::new();
     let mut first_round = true;
     loop {
+        let len_at_iteration_start = inp.len();
         let mut space_error = if first_round {
             first_round = false;
             Vec::new()
@@ -687,9 +688,6 @@ fn set_infallible(mut inp: &str) -> JResult<&str, UserInputLeaf> {
             return Ok((inp, (res, errs)));
         }
         errs.append(&mut space_error);
-        // TODO
-        // here we do the assumption term_or_phrase_infallible always consume something if the
-        // first byte is not `)` or ' '. If it did not, we would end up looping.
 
         let (rest, (delim_term, mut err)) = simple_term_infallible("]")(inp)?;
         errs.append(&mut err);
@@ -697,6 +695,25 @@ fn set_infallible(mut inp: &str) -> JResult<&str, UserInputLeaf> {
             elements.push(term);
         }
         inp = rest;
+
+        // This loop used to assume `simple_term_infallible` always consumes
+        // something when the input starts with neither `]` nor a space. It does
+        // not: some bytes (control characters, for instance) match nothing at
+        // all. Such a byte made the loop spin forever, pushing an error every
+        // pass until the process ran out of memory -- reachable from any user
+        // query containing `IN[`. Requiring progress makes that impossible
+        // regardless of what the term parser does.
+        if inp.len() == len_at_iteration_start {
+            errs.push(LenientErrorInternal {
+                pos: inp.len(),
+                message: "missing ]".to_string(),
+            });
+            let res = UserInputLeaf::Set {
+                field: None,
+                elements,
+            };
+            return Ok((inp, (res, errs)));
+        }
     }
 }
 
@@ -1953,5 +1970,86 @@ mod test {
 
         let query_with_plus = format!("+{leading}title:test{trailing}");
         test_parse_query_to_ast_helper(&query_with_plus, r#""title":test"#);
+    }
+
+    // Regression tests for a fuzzing finding: a `*` that reached the `literal`
+    // parser without a field in front of it used to panic with "Exist query
+    // without a field isn't allowed". The `exists` parser starts with
+    // `multispace0`, so any whitespace before the `*` was enough to get there.
+    // A fieldless `*` is a match-all, so it now resolves to `All`.
+    #[test]
+    fn test_fieldless_star_does_not_panic() {
+        for query in ["\n*\u{0b}\u{06}", "*\u{0c}"] {
+            // The trailing control characters are still left unparsed, so the
+            // strict parser reports an error -- but an error, not a panic.
+            assert!(crate::parse_query(query).is_err());
+            let (ast, _errors) = crate::parse_query_lenient(query);
+            assert_eq!(format!("{ast:?}"), "*");
+        }
+    }
+
+    #[test]
+    fn test_star_with_leading_whitespace_is_match_all() {
+        test_parse_query_to_ast_helper(" *", "*");
+        test_parse_query_to_ast_helper("\n*", "*");
+    }
+
+    // Regression test for a fuzzing finding: `set_infallible` assumed the term
+    // parser always consumes a byte. For these inputs it does not, so the loop
+    // span forever pushing a "missing ]" error every pass -- a 12-byte query
+    // reached 4 GB of resident memory. Terminating at all is the point here; the
+    // error count is asserted so that a future regression shows up as a failure
+    // rather than as an out-of-memory kill.
+    #[test]
+    fn test_unterminated_set_terminates() {
+        for query in ["IN\n[\u{0}\n\n\u{b}", "A\u{0}\u{1f}:IN[\n\n\u{c}\u{7f}["] {
+            let (_ast, errors) = crate::parse_query_lenient(query);
+            assert!(
+                errors.len() < 100,
+                "{query:?} produced {} errors; the non-progress guard is likely gone",
+                errors.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_set_queries_are_unchanged() {
+        test_parse_query_to_ast_helper("title: IN [a b c]", r#""title": IN ["a" "b" "c"]"#);
+    }
+
+    // The behaviour the fix had to leave intact.
+    #[test]
+    fn test_star_and_fielded_exists_are_unchanged() {
+        test_parse_query_to_ast_helper("*", "*");
+        test_parse_query_to_ast_helper("title:*", r#"$exists("title")"#);
+    }
+
+    // Regression test for fuzzing finding: bare `*` with space prefix no panic
+    #[test]
+    fn test_parse_bare_star_with_space_prefix_no_panic() {
+        test_parse_query_to_ast_helper(" *", "*");
+        test_parse_query_to_ast_helper("\n*", "*");
+    }
+
+    // Regression test for fuzzing finding: verify lenient parser on bare star with whitespace
+    #[test]
+    fn test_parse_lenient_bare_star_with_whitespace_no_panic() {
+        let (ast, _) = parse_to_ast_lenient(" *");
+        assert_eq!(format!("{ast:?}"), "*");
+
+        let (ast, _) = parse_to_ast_lenient("\n*");
+        assert_eq!(format!("{ast:?}"), "*");
+    }
+
+    // Regression test: verify bare star still parses correctly
+    #[test]
+    fn test_parse_bare_star_existing_behavior() {
+        test_parse_query_to_ast_helper("*", "*");
+    }
+
+    // Regression test: verify fielded exists query still parses correctly
+    #[test]
+    fn test_parse_fielded_exists_existing_behavior() {
+        test_parse_query_to_ast_helper("title:*", "$exists(\"title\")");
     }
 }

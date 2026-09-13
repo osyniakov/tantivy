@@ -1,7 +1,7 @@
 use std::io;
 use std::ops::Range;
 
-use crate::value::{ValueReader, ValueWriter, deserialize_vint_u64};
+use crate::value::{ValueReader, ValueWriter, deserialize_vint_u64, invalid_data};
 
 /// See module comment.
 #[derive(Default)]
@@ -17,14 +17,23 @@ impl ValueReader for RangeValueReader {
         &self.vals[idx]
     }
 
+    fn num_values(&self) -> Option<usize> {
+        Some(self.vals.len())
+    }
+
     fn load(&mut self, mut data: &[u8]) -> io::Result<usize> {
         self.vals.clear();
         let original_num_bytes = data.len();
-        let len = deserialize_vint_u64(&mut data) as usize;
+        let len = deserialize_vint_u64(&mut data)? as usize;
         if len != 0 {
-            let mut prev_val = deserialize_vint_u64(&mut data);
+            let mut prev_val = deserialize_vint_u64(&mut data)?;
+            // `len` and every delta come out of the block, so a corrupt block
+            // can announce anything: the reads fail once the data runs out,
+            // and the addition is checked rather than trusted.
             for _ in 1..len {
-                let next_val = prev_val + deserialize_vint_u64(&mut data);
+                let next_val = prev_val
+                    .checked_add(deserialize_vint_u64(&mut data)?)
+                    .ok_or_else(|| invalid_data("sstable range value overflows"))?;
                 self.vals.push(prev_val..next_val);
                 prev_val = next_val;
             }

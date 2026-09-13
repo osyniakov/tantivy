@@ -1,3 +1,50 @@
+use std::io;
+
+use common::OwnedBytes;
+
+/// Splits `bytes`, keeping `left_len` bytes on the left.
+///
+/// `OwnedBytes::split` panics when asked for more bytes than it has, which is
+/// the right contract for a length the writer produced. These lengths are read
+/// back out of the file, so they are as untrusted as the rest of it: `what`
+/// names the field so a corrupt column says which one disagreed.
+pub(crate) fn split_checked(
+    bytes: OwnedBytes,
+    left_len: usize,
+    what: &str,
+) -> io::Result<(OwnedBytes, OwnedBytes)> {
+    if left_len > bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{what} declares {left_len} bytes, but only {} remain",
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(bytes.split(left_len))
+}
+
+/// Splits `bytes`, keeping `right_len` bytes on the right.
+///
+/// See [`split_checked`].
+pub(crate) fn rsplit_checked(
+    bytes: OwnedBytes,
+    right_len: usize,
+    what: &str,
+) -> io::Result<(OwnedBytes, OwnedBytes)> {
+    if right_len > bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{what} declares {right_len} bytes, but only {} remain",
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(bytes.rsplit(right_len))
+}
+
 const fn compute_mask(num_bits: u8) -> u8 {
     if num_bits == 8 {
         u8::MAX

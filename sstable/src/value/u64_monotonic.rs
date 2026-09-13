@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::value::{ValueReader, ValueWriter, deserialize_vint_u64};
+use crate::value::{ValueReader, ValueWriter, deserialize_vint_u64, invalid_data};
 use crate::vint;
 
 #[derive(Default)]
@@ -16,14 +16,23 @@ impl ValueReader for U64MonotonicValueReader {
         &self.vals[idx]
     }
 
+    fn num_values(&self) -> Option<usize> {
+        Some(self.vals.len())
+    }
+
     fn load(&mut self, mut data: &[u8]) -> io::Result<usize> {
         let original_num_bytes = data.len();
-        let num_vals = deserialize_vint_u64(&mut data) as usize;
+        let num_vals = deserialize_vint_u64(&mut data)? as usize;
         self.vals.clear();
         let mut prev_val = 0u64;
+        // `num_vals` and every delta come out of the block, so a corrupt block
+        // can announce anything: the reads fail once the data runs out, and
+        // the addition is checked rather than trusted.
         for _ in 0..num_vals {
-            let delta = deserialize_vint_u64(&mut data);
-            let val = prev_val + delta;
+            let delta = deserialize_vint_u64(&mut data)?;
+            let val = prev_val
+                .checked_add(delta)
+                .ok_or_else(|| invalid_data("sstable monotonic value overflows"))?;
             self.vals.push(val);
             prev_val = val;
         }
